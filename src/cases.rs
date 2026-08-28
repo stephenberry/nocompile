@@ -1,0 +1,594 @@
+//! The public API: register fixtures, run them, report.
+
+use std::env;
+use std::fs;
+use std::path::{Component, Path, PathBuf};
+
+use crate::classify::{self, ClassifyError};
+use crate::compare::{self, Mode};
+use crate::compile;
+use crate::normalize::Normalizer;
+use crate::outcome::{CaseOutcome, Failure, Kind, Outcome};
+use crate::scratch::{self, Dependency, Layout};
+
+/// The environment variable that turns a run into a blessing run.
+pub const OVERWRITE_VAR: &str = "NOBUILD";
+
+/// The edition the scratch project declares unless the caller says otherwise.
+///
+/// Deliberately conservative: there is no `CARGO_PKG_EDITION`, so the harness
+/// cannot infer the host crate's edition, and guessing wrong changes what the
+/// goldens contain. Call [`TestCases::edition`] to match your crate.
+const DEFAULT_EDITION: &str = "2021";
+
+#[derive(Debug, Clone)]
+struct Case {
+    /// The fixture's path relative to the host manifest directory, with `/`
+    /// separators. This is what appears in goldens.
+    relative: String,
+    /// Where to actually read it from.
+    absolute: PathBuf,
+    kind: Kind,
+}
+
+/// A set of compile-fail and pass fixtures to run.
+///
+/// Build one with [`cases!`](crate::cases), register fixtures, then call
+/// [`assert`](TestCases::assert):
+///
+/// ```no_run
+/// # fn main() {
+/// let mut t = nobuild::cases!();
+/// t.dependency_path("my-crate", ".");
+/// t.compile_fail_dir("tests/ui");
+/// t.assert();
+/// # }
+/// ```
+#[derive(Debug)]
+pub struct TestCases {
+    manifest_dir: PathBuf,
+    host_pkg_name: String,
+    edition: String,
+    mode: Mode,
+    overwrite: Option<bool>,
+    dependencies: Vec<Dependency>,
+    raw_manifest_lines: Vec<String>,
+    cases: Vec<Case>,
+    /// Problems found while registering fixtures, reported by every `run`.
+    setup: Vec<Failure>,
+}
+
+impl TestCases {
+    /// Create a set of cases for a host crate.
+    ///
+    /// Prefer [`cases!`](crate::cases), which fills both arguments in from
+    /// `env!` at the call site and so cannot be wrong.
+    pub fn new(manifest_dir: impl Into<PathBuf>, host_pkg_name: impl Into<String>) -> Self {
+        Self {
+            manifest_dir: manifest_dir.into(),
+            host_pkg_name: host_pkg_name.into(),
+            edition: DEFAULT_EDITION.to_string(),
+            mode: Mode::default(),
+            overwrite: None,
+            dependencies: Vec::new(),
+            raw_manifest_lines: Vec::new(),
+            cases: Vec::new(),
+            setup: Vec::new(),
+        }
+    }
+
+    /// Make a crate available to every fixture, by path.
+    ///
+    /// `path` is resolved against the host crate's manifest directory. In the
+    /// common case this is one line naming the crate under test.
+    ///
+    /// Dependencies are declared rather than inferred from the host manifest.
+    /// That removes the harness's two heaviest steps, and it is also tighter:
+    /// inference would hand each fixture every dev-dependency of the host crate,
+    /// so a fixture could quietly lean on something the invariant under test
+    /// never mentions.
+    pub fn dependency_path(
+        &mut self,
+        name: impl Into<String>,
+        path: impl AsRef<Path>,
+    ) -> &mut Self {
+        let path = lexical_join(&self.manifest_dir, path.as_ref());
+        self.dependencies.push(Dependency {
+            name: name.into(),
+            path,
+        });
+        self
+    }
+
+    /// Append raw text to the generated manifest.
+    ///
+    /// The escape hatch for anything the typed methods do not cover -- a
+    /// `[features]` table, a `[profile.dev]` override. Note that fixtures build
+    /// with `--offline`, so a registry dependency added this way must already be
+    /// in the local cargo cache.
+    pub fn raw_manifest_lines(&mut self, lines: impl Into<String>) -> &mut Self {
+        self.raw_manifest_lines.push(lines.into());
+        self
+    }
+
+    /// Set the edition the fixtures are compiled under. Defaults to `2021`.
+    pub fn edition(&mut self, edition: impl Into<String>) -> &mut Self {
+        self.edition = edition.into();
+        self
+    }
+
+    /// Choose how diagnostics are compared against goldens. See [`Mode`].
+    pub fn mode(&mut self, mode: Mode) -> &mut Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Force blessing on or off, overriding the `NOBUILD` environment variable.
+    ///
+    /// Mostly useful for a harness testing this harness; ordinary suites set
+    /// `NOBUILD=overwrite` on the command line instead.
+    pub fn overwrite(&mut self, overwrite: bool) -> &mut Self {
+        self.overwrite = Some(overwrite);
+        self
+    }
+
+    /// Register one fixture that must not compile.
+    pub fn compile_fail(&mut self, path: impl AsRef<Path>) -> &mut Self {
+        self.push_file(path.as_ref(), Kind::CompileFail);
+        self
+    }
+
+    /// Register every `.rs` file directly in `dir` as a compile-fail fixture,
+    /// ordered by file name so the report is stable.
+    pub fn compile_fail_dir(&mut self, dir: impl AsRef<Path>) -> &mut Self {
+        self.push_dir(dir.as_ref(), Kind::CompileFail);
+        self
+    }
+
+    /// Register one fixture that must compile. There is no golden; the assertion
+    /// is the exit status.
+    pub fn pass(&mut self, path: impl AsRef<Path>) -> &mut Self {
+        self.push_file(path.as_ref(), Kind::Pass);
+        self
+    }
+
+    /// Register every `.rs` file directly in `dir` as a pass fixture.
+    pub fn pass_dir(&mut self, dir: impl AsRef<Path>) -> &mut Self {
+        self.push_dir(dir.as_ref(), Kind::Pass);
+        self
+    }
+
+    /// Run every registered fixture and hand back what happened, without
+    /// panicking.
+    ///
+    /// This is the entry point a test of the harness itself needs, since four of
+    /// the five cases in such a suite assert that the harness *fails*.
+    pub fn run(&self) -> Outcome {
+        let mut setup = self.setup.clone();
+
+        // A suite that asserts nothing must not report success. This is the same
+        // hazard `NoFixtures` covers, one level up: registration forgotten, or
+        // skipped by a condition that turned out to be false.
+        if self.cases.is_empty() {
+            if setup.is_empty() {
+                setup.push(Failure::NothingRegistered);
+            }
+            return Outcome::new(setup, Vec::new());
+        }
+
+        let layout = Layout::new(&self.manifest_dir, &self.host_pkg_name);
+
+        // Held for the whole run. Every fixture is written to the same
+        // `src/main.rs`, so concurrent runs would compile each other's fixtures.
+        let _lock = match compile::lock(&layout) {
+            Ok(lock) => lock,
+            Err(error) => {
+                setup.push(io_failure(
+                    format!(
+                        "could not lock the scratch project at {}",
+                        layout.root.display()
+                    ),
+                    error,
+                ));
+                return Outcome::new(setup, Vec::new());
+            }
+        };
+
+        if let Err(failure) = self.prepare(&layout) {
+            setup.push(failure);
+            return Outcome::new(setup, Vec::new());
+        }
+
+        let normalizer = Normalizer::new(&layout.root, &layout.main_rs(), &self.manifest_dir);
+
+        let cases = self
+            .cases
+            .iter()
+            .map(|case| {
+                let result = self.run_case(case, &layout, &normalizer);
+                CaseOutcome::new(PathBuf::from(&case.relative), case.kind, result)
+            })
+            .collect();
+
+        Outcome::new(setup, cases)
+    }
+
+    /// Run every registered fixture and panic with a readable report if any did
+    /// not hold up.
+    pub fn assert(&self) {
+        let outcome = self.run();
+        if !outcome.is_success() {
+            panic!("\n{}\n", outcome.report());
+        }
+    }
+
+    /// Create the scratch project and write its manifest.
+    fn prepare(&self, layout: &Layout) -> Result<(), Failure> {
+        // `write_if_changed` creates the directories it writes into, so only the
+        // target directory -- which cargo is handed rather than written to --
+        // needs creating here.
+        fs::create_dir_all(&layout.target).map_err(|error| {
+            io_failure(
+                format!(
+                    "could not create the scratch target directory at {}",
+                    layout.target.display()
+                ),
+                error,
+            )
+        })?;
+
+        let manifest =
+            scratch::manifest(&self.edition, &self.dependencies, &self.raw_manifest_lines);
+        let path = layout.manifest();
+        compile::write_if_changed(&path, &manifest)
+            .map_err(|error| io_failure(format!("could not write {}", path.display()), error))
+    }
+
+    fn run_case(
+        &self,
+        case: &Case,
+        layout: &Layout,
+        normalizer: &Normalizer,
+    ) -> Result<(), Failure> {
+        let source = fs::read_to_string(&case.absolute).map_err(|error| {
+            io_failure(
+                format!("could not read the fixture {}", case.relative),
+                error,
+            )
+        })?;
+
+        // Copied verbatim. The harness does not add a `fn main` for a fixture
+        // that lacks one: detecting that reliably needs a parser, and guessing
+        // it wrong writes harness-injected source into the golden under the
+        // fixture's own name. A fixture without `fn main` gets a plain E0601,
+        // which says exactly what to do about it.
+        let main_rs = layout.main_rs();
+        compile::write_if_changed(&main_rs, &source)
+            .map_err(|error| io_failure(format!("could not write {}", main_rs.display()), error))?;
+
+        let build = compile::build(layout).map_err(|error| {
+            io_failure(
+                format!("could not run cargo for the fixture {}", case.relative),
+                error,
+            )
+        })?;
+
+        match case.kind {
+            Kind::CompileFail => self.check_compile_fail(case, normalizer, &build),
+            Kind::Pass => self.check_pass(case, normalizer, &build),
+        }
+    }
+
+    fn check_compile_fail(
+        &self,
+        case: &Case,
+        normalizer: &Normalizer,
+        build: &compile::Build,
+    ) -> Result<(), Failure> {
+        // The most important failure the harness reports, and the reason it gets
+        // its own message rather than a diff against an empty golden.
+        if build.success {
+            return Err(Failure::Compiled);
+        }
+
+        let kept = classify::classify(&build.stderr).map_err(|error| match error {
+            ClassifyError::Unrecognized(line) => Failure::Unclassified {
+                line,
+                stderr: build.stderr.clone(),
+            },
+            ClassifyError::Cargo(message) => Failure::Cargo { message },
+        })?;
+
+        let actual = compare::filter(&normalizer.normalize(&kept, &case.relative), self.mode);
+        if actual.trim().is_empty() {
+            return Err(Failure::NoDiagnostics {
+                stderr: build.stderr.clone(),
+            });
+        }
+
+        let golden = golden_path(&case.absolute);
+        let golden_relative = golden_path(Path::new(&case.relative));
+
+        if self.overwrite_requested() {
+            return fs::write(&golden, &actual).map_err(|error| {
+                io_failure(
+                    format!("could not write the golden {}", golden_relative.display()),
+                    error,
+                )
+            });
+        }
+
+        // A missing golden is a failure, never an implicit bless: otherwise a new
+        // fixture passes on the run that creates it and nobody reads what it
+        // captured.
+        let expected = match fs::read_to_string(&golden) {
+            Ok(expected) => expected,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Failure::MissingGolden {
+                    golden: golden_relative,
+                });
+            }
+            Err(error) => {
+                return Err(io_failure(
+                    format!("could not read the golden {}", golden_relative.display()),
+                    error,
+                ));
+            }
+        };
+
+        // Both sides are filtered, so `Codes` mode accepts an `Exact` golden and
+        // switching modes does not force a re-bless before the suite is green.
+        let expected = compare::filter(&expected, self.mode);
+        if expected == actual {
+            Ok(())
+        } else {
+            Err(Failure::Mismatch {
+                golden: golden_relative,
+                expected,
+                actual,
+                mode: self.mode,
+            })
+        }
+    }
+
+    fn check_pass(
+        &self,
+        case: &Case,
+        normalizer: &Normalizer,
+        build: &compile::Build,
+    ) -> Result<(), Failure> {
+        if build.success {
+            return Ok(());
+        }
+
+        // No golden here, so an unclassifiable line costs nothing: fall back to
+        // raw stderr rather than burying the compile error under a complaint
+        // about the harness.
+        let stderr = match classify::classify(&build.stderr) {
+            Ok(kept) => normalizer.normalize(&kept, &case.relative),
+            Err(ClassifyError::Cargo(message)) => return Err(Failure::Cargo { message }),
+            Err(ClassifyError::Unrecognized(_)) => build.stderr.clone(),
+        };
+        Err(Failure::DidNotCompile { stderr })
+    }
+
+    fn overwrite_requested(&self) -> bool {
+        if let Some(overwrite) = self.overwrite {
+            return overwrite;
+        }
+        env::var(OVERWRITE_VAR).is_ok_and(|value| value.eq_ignore_ascii_case("overwrite"))
+    }
+
+    fn push_file(&mut self, path: &Path, kind: Kind) {
+        let absolute = lexical_join(&self.manifest_dir, path);
+        let relative = relative_to(&self.manifest_dir, &absolute);
+        self.cases.push(Case {
+            relative,
+            absolute,
+            kind,
+        });
+    }
+
+    fn push_dir(&mut self, dir: &Path, kind: Kind) {
+        let absolute = lexical_join(&self.manifest_dir, dir);
+        let entries = match fs::read_dir(&absolute) {
+            Ok(entries) => entries,
+            Err(error) => {
+                self.setup.push(io_failure(
+                    format!("could not read the fixture directory {}", dir.display()),
+                    error,
+                ));
+                return;
+            }
+        };
+
+        let mut files: Vec<PathBuf> = Vec::new();
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    self.setup.push(io_failure(
+                        format!("could not read an entry of {}", dir.display()),
+                        error,
+                    ));
+                    return;
+                }
+            };
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "rs") && path.is_file() {
+                files.push(path);
+            }
+        }
+
+        // A directory that matches nothing means the suite is not running, which
+        // is worth saying out loud rather than reporting as a clean pass.
+        if files.is_empty() {
+            self.setup.push(Failure::NoFixtures {
+                directory: PathBuf::from(relative_to(&self.manifest_dir, &absolute)),
+            });
+            return;
+        }
+
+        // Sorted by file name so the report order does not depend on the
+        // filesystem.
+        files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+        for file in files {
+            let relative = relative_to(&self.manifest_dir, &file);
+            self.cases.push(Case {
+                relative,
+                absolute: file,
+                kind,
+            });
+        }
+    }
+}
+
+/// Build a [`Failure::Io`]. The `io::Error` is rendered rather than kept so a
+/// failure stays `Clone` and can be reported by more than one run.
+fn io_failure(context: String, error: std::io::Error) -> Failure {
+    Failure::Io {
+        context,
+        message: error.to_string(),
+    }
+}
+
+/// The golden beside a fixture: the same path with a `.stderr` extension.
+fn golden_path(fixture: &Path) -> PathBuf {
+    fixture.with_extension("stderr")
+}
+
+/// Resolve `path` against `base`, folding away `.` and `..` textually so the
+/// generated manifest and the reports read cleanly. Not a canonicalization: no
+/// symlink is followed, because `CARGO_MANIFEST_DIR` is not canonical either and
+/// the two must stay comparable for normalization to match.
+fn lexical_join(base: &Path, path: &Path) -> PathBuf {
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    };
+
+    let mut out = PathBuf::new();
+    for component in joined.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // Only fold a `..` that has a real directory name to cancel.
+                let can_pop = out
+                    .components()
+                    .next_back()
+                    .is_some_and(|c| matches!(c, Component::Normal(_)));
+                if can_pop {
+                    out.pop();
+                } else {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// `path` as seen from `base`, with `/` separators. Falls back to the full path
+/// when it is not under `base`, which keeps the message useful rather than
+/// truncating it to a bare file name.
+fn relative_to(base: &Path, path: &Path) -> String {
+    let path = path.strip_prefix(base).unwrap_or(path);
+    let mut out = String::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir => out.push('/'),
+            other => {
+                if !out.is_empty() && !out.ends_with('/') {
+                    out.push('/');
+                }
+                out.push_str(&other.as_os_str().to_string_lossy());
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_golden_sits_beside_the_fixture() {
+        assert_eq!(
+            golden_path(Path::new("tests/ui/a.rs")),
+            Path::new("tests/ui/a.stderr")
+        );
+    }
+
+    #[test]
+    fn lexical_join_folds_parent_components() {
+        assert_eq!(
+            lexical_join(Path::new("/w/crate"), Path::new("..")),
+            Path::new("/w")
+        );
+        assert_eq!(
+            lexical_join(Path::new("/w/crate"), Path::new("../other")),
+            Path::new("/w/other")
+        );
+        assert_eq!(
+            lexical_join(Path::new("/w"), Path::new("./tests/ui")),
+            Path::new("/w/tests/ui")
+        );
+    }
+
+    #[test]
+    fn lexical_join_keeps_absolute_paths() {
+        assert_eq!(
+            lexical_join(Path::new("/w"), Path::new("/elsewhere")),
+            Path::new("/elsewhere")
+        );
+    }
+
+    #[test]
+    fn relative_to_uses_forward_slashes() {
+        assert_eq!(
+            relative_to(Path::new("/w"), Path::new("/w/tests/ui/a.rs")),
+            "tests/ui/a.rs"
+        );
+    }
+
+    #[test]
+    fn relative_to_keeps_paths_outside_the_base_whole() {
+        assert_eq!(
+            relative_to(Path::new("/w"), Path::new("/x/a.rs")),
+            "/x/a.rs"
+        );
+    }
+
+    #[test]
+    fn dir_registration_records_a_readable_error_rather_than_panicking() {
+        let mut t = TestCases::new("/nonexistent-base", "host");
+        t.compile_fail_dir("tests/ui");
+        let outcome = t.run();
+        assert!(!outcome.is_success());
+        assert!(
+            outcome
+                .report()
+                .contains("could not read the fixture directory tests/ui"),
+            "{}",
+            outcome.report()
+        );
+    }
+
+    #[test]
+    fn fixtures_are_registered_in_file_name_order() {
+        let dir = std::env::temp_dir().join("nobuild-order-test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("ui")).unwrap();
+        for name in ["c.rs", "a.rs", "b.rs", "ignored.txt"] {
+            fs::write(dir.join("ui").join(name), "").unwrap();
+        }
+        let mut t = TestCases::new(&dir, "host");
+        t.compile_fail_dir("ui");
+        let names: Vec<&str> = t.cases.iter().map(|c| c.relative.as_str()).collect();
+        assert_eq!(names, ["ui/a.rs", "ui/b.rs", "ui/c.rs"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

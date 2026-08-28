@@ -1,0 +1,3 @@
+error[E0061]: this function takes 2 arguments but 1 argument was supplied
+--> tests/ui/wrong_arity.rs:5:5
+--> tests/ui/wrong_arity.rs:2:4

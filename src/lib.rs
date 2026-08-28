@@ -1,0 +1,132 @@
+//! Assert that code does **not** compile.
+//!
+//! A compile-fail test asserts that a program does not build, and that it fails
+//! for the intended reason. That is a class of invariant no runtime test can
+//! express, because the whole point is that the offending code never exists as a
+//! binary: a derive refusing a shape it cannot support, a macro's generated
+//! identifiers staying unnameable, a sealed trait staying sealed, a const
+//! assertion firing at compile time, a reference that must not escape a closure.
+//! Without a test that tries to break the guard and observes the error, a
+//! refactor can quietly remove it while every runtime test still passes.
+//!
+//! # Usage
+//!
+//! ```no_run
+//! // tests/ui.rs
+//! #[test]
+//! fn ui() {
+//!     let mut t = nobuild::cases!();
+//!     t.dependency_path("my-crate", ".");   // fixtures need the crate under test
+//!     t.compile_fail_dir("tests/ui");       // every .rs beside its .stderr
+//!     t.assert();
+//! }
+//! ```
+//!
+//! Each fixture is compiled on its own. A `compile_fail` fixture must fail, and
+//! its diagnostics must match the `.stderr` golden beside it. Run the suite with
+//! `NOBUILD=overwrite` to write the goldens, then **read what they captured** --
+//! a missing golden is a failure rather than an implicit bless precisely so that
+//! step does not get skipped.
+//!
+//! # Living with toolchain churn
+//!
+//! Goldens of rendered diagnostics break whenever rustc reflows a message. That
+//! is inherent to the technique, but [`Mode::Codes`] makes it much cheaper:
+//!
+//! ```no_run
+//! # let mut t = nobuild::cases!();
+//! t.mode(nobuild::Mode::Codes);
+//! ```
+//!
+//! `Codes` compares only error codes, primary messages and span headers, and
+//! drops the source snippets, underline art and `= note:` lines that a rustc
+//! release reflows. It still catches every regression that matters: a fixture
+//! that stops failing, or starts failing for a different reason. On one real
+//! 19-fixture suite it takes 436 golden lines down to 78.
+//!
+//! # Zero dependencies, dev-dependencies included
+//!
+//! This crate depends on nothing but `std`, and it has no dev-dependencies
+//! either -- a `[dev-dependencies]` entry shows up in `cargo tree` for anyone
+//! auditing the source, and a harness that reaches for a helper crate to test
+//! itself has undermined its own pitch. Its own compile-fail suite is run by
+//! itself.
+//!
+//! If you do not track your dependency count, [`trybuild`] is more capable and
+//! you should use it. This crate is for the case where a handful of compile-fail
+//! fixtures should not cost a serialization framework and a TOML parser in the
+//! lock file.
+//!
+//! [`trybuild`]: https://docs.rs/trybuild
+//!
+//! # Scope
+//!
+//! Deliberately out: running the compiled program and checking its output, glob
+//! patterns, inferring dependencies from the host manifest, cross-compilation,
+//! custom targets, `-Z` flags, and nightly-only features. The moment a suite
+//! needs any of those, `trybuild` is the answer. Windows is not supported in
+//! v1 -- path normalization and the `\r\n` question need someone with a Windows
+//! machine to get right, and claiming support without testing it is worse than
+//! not claiming it.
+//!
+//! # Requirements on fixtures
+//!
+//! - A fixture is built as a bin and compiled **verbatim**, so it must define
+//!   `fn main`, as `trybuild` fixtures do. The harness does not add one:
+//!   detecting a real `fn main` needs a parser, and a wrong guess writes
+//!   harness-injected source into the golden under the fixture's own name. A
+//!   fixture without one gets a plain `E0601`, which says what to do about it.
+//! - Fixtures build with `--offline`, so any dependency must be a path
+//!   dependency or already in the local cargo cache.
+//! - Warnings from the crate under test land in the fixture's stderr and so in
+//!   its golden, exactly as they do with `trybuild`. Keep the crate under test
+//!   warning-clean, or use [`Mode::Codes`].
+//! - A diagnostic message beginning with `aborting due to` is suppressed by
+//!   **cargo itself**, before any harness can see it, because cargo filters
+//!   rustc's own abort line there. If a `compile_error!` in your crate is worded
+//!   that way it will never reach a golden; word it differently.
+//!
+//! # Concurrency
+//!
+//! Every fixture in a run is written to the same scratch `src/main.rs`, so a run
+//! holds an exclusive lock on its scratch project and concurrent runs serialize.
+//! Two `#[test]` functions each calling [`cases!`] is safe, as is `cargo
+//! nextest` or two `cargo test` invocations at once -- without the lock they
+//! would compile each other's fixtures and report a broken fixture as passing.
+
+#![forbid(unsafe_code)]
+#![warn(missing_docs, missing_debug_implementations)]
+
+mod cases;
+mod classify;
+mod compare;
+mod compile;
+mod diff;
+mod normalize;
+mod outcome;
+mod scratch;
+
+pub use crate::cases::{OVERWRITE_VAR, TestCases};
+pub use crate::compare::Mode;
+pub use crate::outcome::{CaseOutcome, Failure, Kind, Outcome};
+
+/// Build a [`TestCases`] for the crate the macro is expanded in.
+///
+/// Expands to `TestCases::new(env!("CARGO_MANIFEST_DIR"), env!("CARGO_PKG_NAME"))`.
+/// Both resolve in the *caller's* crate at compile time, so unlike reading the
+/// same variables at run time they cannot be wrong.
+///
+/// ```no_run
+/// let mut t = nobuild::cases!();
+/// t.compile_fail("tests/ui/rejects_union.rs");
+/// t.assert();
+/// ```
+#[macro_export]
+macro_rules! cases {
+    () => {
+        $crate::TestCases::new(
+            ::std::env!("CARGO_MANIFEST_DIR"),
+            ::std::env!("CARGO_PKG_NAME"),
+        )
+    };
+}

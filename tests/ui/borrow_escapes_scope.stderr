@@ -1,0 +1,2 @@
+error[E0597]: `inner` does not live long enough
+--> tests/ui/borrow_escapes_scope.rs:8:17

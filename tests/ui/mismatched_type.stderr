@@ -1,0 +1,2 @@
+error[E0308]: mismatched types
+--> tests/ui/mismatched_type.rs:3:18

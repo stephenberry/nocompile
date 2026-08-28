@@ -1,0 +1,19 @@
+[package]
+name = "nobuild"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT OR Apache-2.0"
+description = "Assert that code does NOT compile. A compile-fail test harness with zero dependencies -- std only, dev-dependencies included."
+repository = "https://github.com/stephenberry/nobuild"
+readme = "README.md"
+keywords = ["testing", "compile-fail", "trybuild", "ui-test", "macros"]
+categories = ["development-tools::testing"]
+
+# The point of this crate. Both tables are intentionally empty and must stay that
+# way: a `[dev-dependencies]` entry shows up in `cargo tree` for anyone auditing
+# the source, and a harness that reaches for a helper crate to test itself has
+# undermined its own pitch. The self-test suite is the harness running itself.
+[dependencies]
+
+[dev-dependencies]
