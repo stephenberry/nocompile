@@ -121,7 +121,7 @@ impl Display for Failure {
             ),
             Failure::MissingGolden { golden } => write!(
                 f,
-                "no golden at {}\nrun with NOBUILD=overwrite to create it, then read what it captured",
+                "no golden at {}\nrun with NOCOMPILE=overwrite to create it, then read what it captured",
                 golden.display()
             ),
             Failure::Mismatch {
@@ -141,12 +141,12 @@ impl Display for Failure {
                 let diff = diff::unified(expected, actual, &golden.display().to_string(), "actual");
                 write!(
                     f,
-                    "\n\n{diff}\nrun with NOBUILD=overwrite to update the golden"
+                    "\n\n{diff}\nrun with NOCOMPILE=overwrite to update the golden"
                 )
             }
             Failure::Unclassified { line, stderr } => write!(
                 f,
-                "nobuild does not understand this output line:\n\n    {line}\n\n\
+                "nocompile does not understand this output line:\n\n    {line}\n\n\
                  It is at column 0 and starts no recognized diagnostic block, so the harness \
                  cannot tell whether it belongs in the golden. Full stderr:\n\n{stderr}"
             ),
@@ -248,11 +248,11 @@ impl Outcome {
         let total = self.cases.len();
 
         if self.setup.is_empty() && failed == 0 {
-            let _ = write!(out, "nobuild: {total} case(s) passed");
+            let _ = write!(out, "nocompile: {total} case(s) passed");
             return out;
         }
 
-        let _ = writeln!(out, "nobuild: {failed} of {total} case(s) failed");
+        let _ = writeln!(out, "nocompile: {failed} of {total} case(s) failed");
 
         for failure in &self.setup {
             let _ = writeln!(out, "\nSETUP FAILED");

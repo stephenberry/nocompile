@@ -12,7 +12,7 @@ use crate::outcome::{CaseOutcome, Failure, Kind, Outcome};
 use crate::scratch::{self, Dependency, Layout};
 
 /// The environment variable that turns a run into a blessing run.
-pub const OVERWRITE_VAR: &str = "NOBUILD";
+pub const OVERWRITE_VAR: &str = "NOCOMPILE";
 
 /// The edition the scratch project declares unless the caller says otherwise.
 ///
@@ -41,7 +41,7 @@ struct Case {
 ///
 /// ```no_run
 /// # fn main() {
-/// let mut t = nobuild::cases!();
+/// let mut t = nocompile::cases!();
 /// t.dependency_path("my-crate", ".");
 /// t.compile_fail_dir("tests/ui");
 /// t.assert();
@@ -134,10 +134,10 @@ impl TestCases {
         self
     }
 
-    /// Force blessing on or off, overriding the `NOBUILD` environment variable.
+    /// Force blessing on or off, overriding the `NOCOMPILE` environment variable.
     ///
     /// Mostly useful for a harness testing this harness; ordinary suites set
-    /// `NOBUILD=overwrite` on the command line instead.
+    /// `NOCOMPILE=overwrite` on the command line instead.
     pub fn overwrite(&mut self, overwrite: bool) -> &mut Self {
         self.overwrite = Some(overwrite);
         self
@@ -595,7 +595,7 @@ mod tests {
 
     #[test]
     fn fixtures_are_registered_in_file_name_order() {
-        let dir = std::env::temp_dir().join("nobuild-order-test");
+        let dir = std::env::temp_dir().join("nocompile-order-test");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("ui")).unwrap();
         for name in ["c.rs", "a.rs", "b.rs", "ignored.txt"] {

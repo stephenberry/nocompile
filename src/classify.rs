@@ -227,13 +227,13 @@ impl<'a> Head<'a> {
     ///
     /// ```text
     /// error: aborting due to 2 previous errors
-    /// error: could not compile `nobuild-scratch` (bin "fixture") due to 2 previous errors
+    /// error: could not compile `nocompile-scratch` (bin "fixture") due to 2 previous errors
     /// warning: 3 warnings emitted
-    /// warning: `nobuild-scratch` (bin "fixture") generated 1 warning
+    /// warning: `nocompile-scratch` (bin "fixture") generated 1 warning
     /// ```
     ///
     /// Two reasons to drop all four. The cargo pair names the scratch crate and
-    /// would leak `nobuild-scratch` into every golden. The rustc pair is a
+    /// would leak `nocompile-scratch` into every golden. The rustc pair is a
     /// count, so adding one diagnostic to a fixture rewrites a line that
     /// describes nothing about the invariant under test.
     ///
@@ -327,11 +327,11 @@ error[E0080]: evaluation panicked
 
     #[test]
     fn an_unrecognized_column_zero_line_is_a_hard_error() {
-        let err = classify("Compiling nobuild-scratch v0.0.0\n").unwrap_err();
+        let err = classify("Compiling nocompile-scratch v0.0.0\n").unwrap_err();
         let ClassifyError::Unrecognized(line) = err else {
             panic!("expected Unrecognized, got {err:?}");
         };
-        assert_eq!(line, "Compiling nobuild-scratch v0.0.0");
+        assert_eq!(line, "Compiling nocompile-scratch v0.0.0");
     }
 
     #[test]
@@ -351,7 +351,7 @@ error[E0080]: evaluation panicked
     fn drops_the_cargo_compile_summary() {
         let stderr = format!(
             "{DIAGNOSTIC}\nerror: aborting due to 1 previous error\n\n\
-             error: could not compile `nobuild-scratch` (bin \"fixture\") due to 1 previous error\n"
+             error: could not compile `nocompile-scratch` (bin \"fixture\") due to 1 previous error\n"
         );
         assert_eq!(kept(&stderr), DIAGNOSTIC.trim_end());
     }
@@ -362,7 +362,7 @@ error[E0080]: evaluation panicked
 warning: unused variable: `x`
  --> src/main.rs:2:9
 
-warning: `nobuild-scratch` (bin \"fixture\") generated 1 warning
+warning: `nocompile-scratch` (bin \"fixture\") generated 1 warning
 ";
         assert_eq!(
             kept(stderr),
@@ -393,7 +393,7 @@ warning: `nobuild-scratch` (bin \"fixture\") generated 1 warning
     #[test]
     fn a_dropped_blocks_body_goes_with_it() {
         let stderr = "\
-error: could not compile `nobuild-scratch` (bin \"fixture\") due to 1 previous error
+error: could not compile `nocompile-scratch` (bin \"fixture\") due to 1 previous error
   this line belongs to the summary
 error: kept
 ";
@@ -467,7 +467,7 @@ error: could not compile `something` due to a reason
     #[test]
     fn a_failure_to_run_rustc_is_a_cargo_failure_with_its_chain() {
         let stderr = "\
-error: could not compile `nobuild-scratch` (bin \"fixture\")
+error: could not compile `nocompile-scratch` (bin \"fixture\")
 
 Caused by:
   process didn't exit successfully: `rustc ...` (exit status: 1)

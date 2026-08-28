@@ -436,8 +436,8 @@ mod tests {
 
     fn normalizer() -> Normalizer {
         Normalizer {
-            scratch_main: "/w/target/nobuild/host/project/src/main.rs".into(),
-            scratch_root: "/w/target/nobuild/host".into(),
+            scratch_main: "/w/target/nocompile/host/project/src/main.rs".into(),
+            scratch_root: "/w/target/nocompile/host".into(),
             manifest_dir: "/w".into(),
             cargo_home: Some("/home/u/.cargo".into()),
             dependencies: Vec::new(),
@@ -464,7 +464,7 @@ mod tests {
     #[test]
     fn rewrites_the_absolute_scratch_main_to_the_fixture() {
         let out = normalizer().normalize(
-            "note: at /w/target/nobuild/host/project/src/main.rs:1:1\n",
+            "note: at /w/target/nocompile/host/project/src/main.rs:1:1\n",
             "tests/ui/a.rs",
         );
         assert_eq!(out, "note: at tests/ui/a.rs:1:1\n");
@@ -472,7 +472,7 @@ mod tests {
 
     #[test]
     fn rewrites_the_scratch_root_before_the_manifest_dir() {
-        let out = normalizer().normalize("note: /w/target/nobuild/host/target/debug\n", "f.rs");
+        let out = normalizer().normalize("note: /w/target/nocompile/host/target/debug\n", "f.rs");
         assert_eq!(out, "note: $SCRATCH/target/debug\n");
     }
 

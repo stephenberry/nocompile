@@ -1,11 +1,11 @@
 [package]
-name = "nobuild"
+name = "nocompile"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.96"
 license = "MIT OR Apache-2.0"
 description = "Assert that code does NOT compile. A compile-fail test harness with zero dependencies -- std only, dev-dependencies included."
-repository = "https://github.com/stephenberry/nobuild"
+repository = "https://github.com/stephenberry/nocompile"
 readme = "README.md"
 keywords = ["testing", "compile-fail", "trybuild", "ui-test", "macros"]
 categories = ["development-tools::testing"]

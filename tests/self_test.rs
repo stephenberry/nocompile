@@ -14,7 +14,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use nobuild::{Failure, Mode, Outcome, TestCases};
+use nocompile::{Failure, Mode, Outcome, TestCases};
 
 /// A throwaway host crate: a directory of fixtures the test owns outright.
 struct Sandbox {
@@ -57,7 +57,7 @@ impl Sandbox {
 ///
 /// Also how a case gets a path *outside* its sandbox: these are all siblings.
 fn fresh_dir(name: &str) -> PathBuf {
-    let dir = target_dir().join("nobuild-selftest").join(name);
+    let dir = target_dir().join("nocompile-selftest").join(name);
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).expect("create test directory");
     dir
@@ -127,7 +127,7 @@ fn a_rejected_fixture_with_a_correct_golden_passes() {
         "the span should point at the fixture, not the scratch project:\n{golden}"
     );
     assert!(
-        !golden.contains("nobuild-scratch") && !golden.contains("src/main.rs"),
+        !golden.contains("nocompile-scratch") && !golden.contains("src/main.rs"),
         "the scratch project leaked into the golden:\n{golden}"
     );
 

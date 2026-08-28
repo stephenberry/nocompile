@@ -1,4 +1,4 @@
-//! `nobuild`'s own UI suite, run by `nobuild`.
+//! `nocompile`'s own UI suite, run by `nocompile`.
 //!
 //! These fixtures assert language invariants rather than anything specific to
 //! this crate, because the crate exposes no macros or traits of its own to
@@ -10,11 +10,11 @@
 //! and this crate is expected to build on more than one toolchain, which is the
 //! exact situation `Codes` exists for.
 
-use nobuild::Mode;
+use nocompile::Mode;
 
 #[test]
 fn ui() {
-    let mut t = nobuild::cases!();
+    let mut t = nocompile::cases!();
     t.mode(Mode::Codes);
     t.compile_fail_dir("tests/ui");
     t.pass_dir("tests/ui-pass");

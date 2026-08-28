@@ -1,4 +1,4 @@
-# nobuild
+# nocompile
 
 **Assert that code does _not_ compile.** A compile-fail test harness that depends on nothing but `std` — dev-dependencies included.
 
@@ -18,7 +18,7 @@ Every one of these is enforced by the type system, by const evaluation, or by ma
 // tests/ui.rs
 #[test]
 fn ui() {
-    let mut t = nobuild::cases!();
+    let mut t = nocompile::cases!();
     t.dependency_path("my-crate", ".");   // fixtures need the crate under test
     t.compile_fail_dir("tests/ui");       // every .rs beside its .stderr
     t.assert();
@@ -32,12 +32,12 @@ tests/ui/rejects_union.rs
 tests/ui/rejects_union.stderr
 ```
 
-Write the goldens with `NOBUILD=overwrite cargo test`, then **read what they captured**. A missing golden is a failure rather than an implicit bless precisely so that step does not get skipped — otherwise a new fixture passes on the run that creates it and nobody looks at what it recorded.
+Write the goldens with `NOCOMPILE=overwrite cargo test`, then **read what they captured**. A missing golden is a failure rather than an implicit bless precisely so that step does not get skipped — otherwise a new fixture passes on the run that creates it and nobody looks at what it recorded.
 
 Everything else is opt-in:
 
 ```rust
-t.mode(nobuild::Mode::Codes);                 // less brittle comparison, below
+t.mode(nocompile::Mode::Codes);                 // less brittle comparison, below
 t.compile_fail("tests/ui/just_this_one.rs");
 t.pass_dir("tests/ui-pass");                  // fixtures that must still compile
 t.edition("2024");
@@ -49,10 +49,10 @@ One struct, ten methods, two enums. That is the whole library.
 
 ## Living with toolchain churn
 
-`.stderr` goldens break whenever rustc reflows a diagnostic. That is inherent to golden-matching rendered text, and it is the worst property of this style of test. `nobuild` cannot fix it, but it offers a cheaper mode — the one axis on which it is _better_ than the alternative rather than merely lighter:
+`.stderr` goldens break whenever rustc reflows a diagnostic. That is inherent to golden-matching rendered text, and it is the worst property of this style of test. `nocompile` cannot fix it, but it offers a cheaper mode — the one axis on which it is _better_ than the alternative rather than merely lighter:
 
 ```rust
-t.mode(nobuild::Mode::Codes);
+t.mode(nocompile::Mode::Codes);
 ```
 
 `Codes` compares only error codes, primary messages and span headers:
@@ -89,13 +89,13 @@ The filter is applied to both sides of the comparison, so an existing `Exact` go
 
 ## Zero dependencies, dev-dependencies included
 
-A crate whose selling point is "no dependencies" cannot have dev-dependencies either. A `[dev-dependencies]` entry shows up in `cargo tree` for anyone vendoring or auditing the source, and a harness that reaches for a helper crate to test itself has undermined its own pitch. `nobuild`'s own compile-fail suite is run by `nobuild`, and everything else is `assert_eq!` on strings.
+A crate whose selling point is "no dependencies" cannot have dev-dependencies either. A `[dev-dependencies]` entry shows up in `cargo tree` for anyone vendoring or auditing the source, and a harness that reaches for a helper crate to test itself has undermined its own pitch. `nocompile`'s own compile-fail suite is run by `nocompile`, and everything else is `assert_eq!` on strings.
 
 ## Should you use this?
 
 **Probably not.** [`trybuild`] is the standard answer, it is battle-tested across thousands of crates, and it is more capable. This is not a criticism of it — it is a different point on the dependency/complexity curve.
 
-Use `nobuild` if you keep a deliberately small dependency surface and currently pay a large one for a handful of compile-fail fixtures: `no_std`-adjacent crates, cryptography and safety-critical libraries, anything audited, anything embedded, anything whose pitch is its dependency tree. In one real workspace, `trybuild` was the only root of fifteen lock entries:
+Use `nocompile` if you keep a deliberately small dependency surface and currently pay a large one for a handful of compile-fail fixtures: `no_std`-adjacent crates, cryptography and safety-critical libraries, anything audited, anything embedded, anything whose pitch is its dependency tree. In one real workspace, `trybuild` was the only root of fifteen lock entries:
 
 ```
 glob  serde  serde_core  serde_derive  serde_json  itoa  memchr  zmij
@@ -132,7 +132,7 @@ In practice this is roughly 100 ms per fixture and it scales linearly, so a 17-f
 
 ## Declared dependencies, not inferred ones
 
-`nobuild` writes the scratch project's manifest instead of reading yours. That removes both a TOML parser and a `cargo metadata` invocation, and it is also tighter: inference hands every fixture every dev-dependency of the host crate, so a fixture can quietly lean on something the invariant under test never mentions. Explicit is both cheaper and stricter. In the common case it is one line.
+`nocompile` writes the scratch project's manifest instead of reading yours. That removes both a TOML parser and a `cargo metadata` invocation, and it is also tighter: inference hands every fixture every dev-dependency of the host crate, so a fixture can quietly lean on something the invariant under test never mentions. Explicit is both cheaper and stricter. In the common case it is one line.
 
 ```rust
 t.dependency_path("my-crate", ".");
@@ -155,11 +155,11 @@ t.edition("2021");
 
 ## Concurrency
 
-Every fixture in a run is written to the same scratch `src/main.rs`, so a run holds an exclusive lock on its scratch project and concurrent runs serialize. Two `#[test]` functions each calling `nobuild::cases!()` is safe, as is `cargo nextest` or two `cargo test` invocations at once. Without the lock they would compile each other's fixtures and report a broken fixture as passing.
+Every fixture in a run is written to the same scratch `src/main.rs`, so a run holds an exclusive lock on its scratch project and concurrent runs serialize. Two `#[test]` functions each calling `nocompile::cases!()` is safe, as is `cargo nextest` or two `cargo test` invocations at once. Without the lock they would compile each other's fixtures and report a broken fixture as passing.
 
 ## How it works
 
-`trybuild` runs `cargo build --message-format=json` and reads each diagnostic's pre-rendered `rendered` field, which is why it needs a JSON stack. But `rendered` is byte-for-byte what plain stderr prints — cargo renders it and the JSON just carries the same string. So `nobuild` reads plain stderr with `--quiet`, which is already almost exactly the golden.
+`trybuild` runs `cargo build --message-format=json` and reads each diagnostic's pre-rendered `rendered` field, which is why it needs a JSON stack. But `rendered` is byte-for-byte what plain stderr prints — cargo renders it and the JSON just carries the same string. So `nocompile` reads plain stderr with `--quiet`, which is already almost exactly the golden.
 
 What remains is cargo's and rustc's own summary lines, which name the scratch crate and count the errors. Those are **classified** out rather than filtered out: every line at column 0 is matched against a known shape, and one that matches nothing is a hard error naming the line. The failure mode of a silent filter is garbage creeping into goldens; the failure mode of this is a loud, actionable message the first time cargo changes its output.
 
@@ -201,7 +201,7 @@ Those numbers record where a dependency happens to put its code today. Without t
 
 Fixtures compile under edition 2024 unless you call `t.edition(...)`, and `trybuild` inherited the edition from your manifest. If your crate is not on 2024, set it explicitly before blessing — edition 2024 is not diagnostic-neutral, so a fixture can change error code or even stop failing, which silently turns a `compile_fail` case green.
 
-Goldens are usually close but not portable verbatim, since the normalization differs. Re-bless with `NOBUILD=overwrite` and **read the diff line by line** — a migration that blesses without reading silently accepts whatever the new harness produces, including nothing at all. Then confirm the dependencies actually left with `cargo tree -i -p <each>`.
+Goldens are usually close but not portable verbatim, since the normalization differs. Re-bless with `NOCOMPILE=overwrite` and **read the diff line by line** — a migration that blesses without reading silently accepts whatever the new harness produces, including nothing at all. Then confirm the dependencies actually left with `cargo tree -i -p <each>`.
 
 ## MSRV
 

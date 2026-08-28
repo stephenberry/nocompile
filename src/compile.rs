@@ -79,7 +79,7 @@ fn cargo() -> std::ffi::OsString {
 /// the same scratch project, so two runs sharing one host crate would interleave
 /// write-then-build and compile each other's fixtures. That is not a theoretical
 /// race: `cargo test` runs `#[test]` functions in parallel threads, so two test
-/// functions each calling `nobuild::cases!()` hit it every time, and the
+/// functions each calling `nocompile::cases!()` hit it every time, and the
 /// symptom is a broken fixture reported as passing.
 ///
 /// The lock is held for the whole of a run and released when the returned file

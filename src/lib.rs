@@ -15,7 +15,7 @@
 //! // tests/ui.rs
 //! #[test]
 //! fn ui() {
-//!     let mut t = nobuild::cases!();
+//!     let mut t = nocompile::cases!();
 //!     t.dependency_path("my-crate", ".");   // fixtures need the crate under test
 //!     t.compile_fail_dir("tests/ui");       // every .rs beside its .stderr
 //!     t.assert();
@@ -24,7 +24,7 @@
 //!
 //! Each fixture is compiled on its own. A `compile_fail` fixture must fail, and
 //! its diagnostics must match the `.stderr` golden beside it. Run the suite with
-//! `NOBUILD=overwrite` to write the goldens, then **read what they captured** --
+//! `NOCOMPILE=overwrite` to write the goldens, then **read what they captured** --
 //! a missing golden is a failure rather than an implicit bless precisely so that
 //! step does not get skipped.
 //!
@@ -34,8 +34,8 @@
 //! is inherent to the technique, but [`Mode::Codes`] makes it much cheaper:
 //!
 //! ```no_run
-//! # let mut t = nobuild::cases!();
-//! t.mode(nobuild::Mode::Codes);
+//! # let mut t = nocompile::cases!();
+//! t.mode(nocompile::Mode::Codes);
 //! ```
 //!
 //! `Codes` compares only error codes, primary messages and span headers, and
@@ -117,7 +117,7 @@ pub use crate::outcome::{CaseOutcome, Failure, Kind, Outcome};
 /// same variables at run time they cannot be wrong.
 ///
 /// ```no_run
-/// let mut t = nobuild::cases!();
+/// let mut t = nocompile::cases!();
 /// t.compile_fail("tests/ui/rejects_union.rs");
 /// t.assert();
 /// ```
