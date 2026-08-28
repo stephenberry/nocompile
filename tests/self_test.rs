@@ -26,12 +26,9 @@ impl Sandbox {
     /// `name` must be unique per test: it names both the sandbox directory and
     /// the harness's scratch project, and `cargo test` runs tests in parallel.
     fn new(name: &str) -> Self {
-        let dir = target_dir().join("nobuild-selftest").join(name);
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("create sandbox");
         Sandbox {
             name: name.to_string(),
-            dir,
+            dir: fresh_dir(name),
         }
     }
 
@@ -54,6 +51,16 @@ impl Sandbox {
     fn cases(&self) -> TestCases {
         TestCases::new(&self.dir, &self.name)
     }
+}
+
+/// An empty directory under the self-test root, replacing whatever was there.
+///
+/// Also how a case gets a path *outside* its sandbox: these are all siblings.
+fn fresh_dir(name: &str) -> PathBuf {
+    let dir = target_dir().join("nobuild-selftest").join(name);
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("create test directory");
+    dir
 }
 
 /// The target directory this test binary was built into.
@@ -624,4 +631,108 @@ fn a_cargo_failure_is_not_reported_as_a_diagnostic() {
         !sandbox.path("ui/rejected.stderr").exists(),
         "bless wrote a golden from a manifest cargo could not parse"
     );
+}
+
+/// A diagnostic that reaches into a path dependency living *outside* the host
+/// crate must not put that dependency's absolute path, or its line numbers, in
+/// the golden.
+///
+/// Both halves are load-bearing for a workspace of any size. The path is what
+/// makes a golden unshareable: it names one checkout on one machine. The line
+/// numbers are what makes it brittle: they pin where the dependency happens to
+/// put its code today, so inserting a line anywhere above the span would
+/// re-bless the golden for a reason that has nothing to do with the invariant
+/// under test. This test asserts that second half by doing exactly that.
+#[test]
+fn a_diagnostic_reaching_into_an_outside_dependency_is_portable() {
+    let sandbox = Sandbox::new("outside-dependency");
+    // A sibling of the sandbox, so the dependency is genuinely outside the host
+    // crate's manifest directory -- which is the case `$DIR` cannot cover.
+    let outsider = fresh_dir("outside-dependency-dep");
+    let source = |leading: &str| {
+        format!("{leading}pub trait Small {{}}\npub fn take<T: Small>(_value: T) {{}}\n")
+    };
+    fs::write(
+        outsider.join("Cargo.toml"),
+        "[package]\nname = \"outsider\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[dependencies]\n",
+    )
+    .expect("write dependency manifest");
+    fs::create_dir_all(outsider.join("src")).expect("create dependency src");
+    fs::write(outsider.join("src/lib.rs"), source("")).expect("write dependency source");
+
+    sandbox.write(
+        "ui/violates_bound.rs",
+        "fn main() {\n    outsider::take(\"not small\");\n}\n",
+    );
+
+    let mut t = sandbox.cases();
+    t.dependency_path("outsider", "../outside-dependency-dep");
+    t.compile_fail("ui/violates_bound.rs");
+    assert_passed(&t.overwrite(true).run());
+
+    let golden = sandbox.read("ui/violates_bound.stderr");
+    assert!(
+        !golden.contains(outsider.to_str().expect("utf-8 sandbox path")),
+        "the dependency's absolute path reached the golden:\n{golden}"
+    );
+    assert!(
+        golden.contains("$OUTSIDER/src/lib.rs"),
+        "expected a dependency placeholder:\n{golden}"
+    );
+    assert!(
+        !golden.contains("$OUTSIDER/src/lib.rs:"),
+        "the dependency's line and column reached the golden:\n{golden}"
+    );
+    // The fixture's own span is the thing under test, and keeps its position.
+    assert!(
+        golden.contains("--> ui/violates_bound.rs:2:20"),
+        "the fixture's own span lost its position:\n{golden}"
+    );
+
+    // Now move the dependency's code down a line, changing nothing the golden
+    // has any business recording. The unchanged golden must still match.
+    fs::write(outsider.join("src/lib.rs"), source("//! A helper crate.\n"))
+        .expect("rewrite dependency source");
+
+    let mut t = sandbox.cases();
+    t.dependency_path("outsider", "../outside-dependency-dep");
+    t.compile_fail("ui/violates_bound.rs");
+    assert_passed(&t.overwrite(false).run());
+}
+
+/// A diagnostic that reaches into the standard library must not put the
+/// toolchain's location in the golden.
+///
+/// That path carries both the user's home directory and the host triple, so a
+/// golden holding one passes only on the machine that blessed it. Any trait
+/// bound involving a std type produces such a span, which makes this the most
+/// common way a suite stops being portable.
+#[test]
+fn a_diagnostic_reaching_into_the_standard_library_is_portable() {
+    let sandbox = Sandbox::new("sysroot-span");
+    sandbox.write(
+        "ui/collects_wrong.rs",
+        "struct Token;\nfn main() {\n    let _v: Vec<u8> = std::iter::once(Token).collect();\n}\n",
+    );
+
+    let mut t = sandbox.cases();
+    t.compile_fail("ui/collects_wrong.rs");
+    assert_passed(&t.overwrite(true).run());
+
+    let golden = sandbox.read("ui/collects_wrong.stderr");
+    assert!(
+        golden.contains("$RUST/"),
+        "expected a toolchain placeholder:\n{golden}"
+    );
+    assert!(
+        !golden.contains("rustlib") && !golden.contains(".rustup"),
+        "the toolchain's location reached the golden:\n{golden}"
+    );
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = home.to_str().expect("utf-8 home");
+        assert!(
+            !golden.contains(home),
+            "the home directory reached the golden:\n{golden}"
+        );
+    }
 }

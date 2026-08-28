@@ -16,10 +16,13 @@ pub const OVERWRITE_VAR: &str = "NOBUILD";
 
 /// The edition the scratch project declares unless the caller says otherwise.
 ///
-/// Deliberately conservative: there is no `CARGO_PKG_EDITION`, so the harness
-/// cannot infer the host crate's edition, and guessing wrong changes what the
-/// goldens contain. Call [`TestCases::edition`] to match your crate.
-const DEFAULT_EDITION: &str = "2021";
+/// There is no `CARGO_PKG_EDITION`, and dependencies are declared rather than
+/// inferred, so there is no host manifest to read it out of either. Some default
+/// has to be picked, and the current edition is the predictable one: it is what
+/// a new crate gets from `cargo new`, and it matches this crate's own. Guessing
+/// wrong changes what the goldens contain rather than erroring, so
+/// [`TestCases::edition`] is worth setting explicitly on an older crate.
+const DEFAULT_EDITION: &str = "2024";
 
 #[derive(Debug, Clone)]
 struct Case {
@@ -87,6 +90,10 @@ impl TestCases {
     /// inference would hand each fixture every dev-dependency of the host crate,
     /// so a fixture could quietly lean on something the invariant under test
     /// never mentions.
+    ///
+    /// A dependency outside the host crate also gets a normalization
+    /// placeholder, `my-crate` becoming `$MY_CRATE`, so a diagnostic that points
+    /// into its source does not put an absolute path in a golden.
     pub fn dependency_path(
         &mut self,
         name: impl Into<String>,
@@ -111,7 +118,11 @@ impl TestCases {
         self
     }
 
-    /// Set the edition the fixtures are compiled under. Defaults to `2021`.
+    /// Set the edition the fixtures are compiled under. Defaults to `2024`.
+    ///
+    /// Worth setting explicitly if the host crate is on an older edition. A
+    /// mismatch does not error -- the fixtures simply compile under different
+    /// rules, and the goldens quietly record the difference.
     pub fn edition(&mut self, edition: impl Into<String>) -> &mut Self {
         self.edition = edition.into();
         self
@@ -199,7 +210,12 @@ impl TestCases {
             return Outcome::new(setup, Vec::new());
         }
 
-        let normalizer = Normalizer::new(&layout.root, &layout.main_rs(), &self.manifest_dir);
+        let normalizer = Normalizer::new(
+            &layout.root,
+            &layout.main_rs(),
+            &self.manifest_dir,
+            &self.dependencies,
+        );
 
         let cases = self
             .cases

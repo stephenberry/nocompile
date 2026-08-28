@@ -120,9 +120,15 @@ And be honest about the size of the win: `trybuild` is a dev-dependency. It neve
 | Glob patterns | A directory or an explicit file covers every real use and costs no matcher. This is why `trybuild` needs `glob`. |
 | Inferring dependencies from the host manifest | The single biggest simplification, and also better behaviour — see below. |
 | Cross-compilation, custom targets, `-Z` flags, nightly-only features | A compile-fail suite runs on the host toolchain. If you need more, you need `trybuild`. |
-| Windows | Not in v1. Path normalization and the `\r\n` question need someone with a Windows machine to get right, and claiming support without testing it is worse than not claiming it. The normalization is kept in one function so it is a contained addition later. |
+| Windows | Not in v1. Path normalization and the `\r\n` question need someone with a Windows machine to get right, and claiming support without testing it is worse than not claiming it. Note the separator mismatch is not merely cosmetic: the rule below that keeps line numbers only for the fixture's own spans would fail to recognise `src\main.rs` as the fixture and strip them from every span. The normalization is kept in one module so it is a contained addition later. |
 
 The moment a suite grows past what the host toolchain can express, `trybuild` is the answer and this crate would rather say so than grow toward it.
+
+### Speed
+
+One fixture is one `cargo build`, so cargo's startup and fingerprint scan are paid once per fixture. `trybuild` builds all fixtures in a single invocation and demultiplexes the diagnostics back to each one — which it can do because it is already parsing `--message-format=json`, where every diagnostic carries the file it belongs to. Plain stderr has no such delimiter, so batching here would mean guessing which fixture each interleaved block came from. That is the direct cost of the zero-dependency design, not an oversight, and it will not be fixed without taking the JSON dependency back.
+
+In practice this is roughly 100 ms per fixture and it scales linearly, so a 17-fixture suite spends about a second where `trybuild` spends half of one. Fine at that size; worth knowing before pointing it at a suite of hundreds.
 
 ## Declared dependencies, not inferred ones
 
@@ -131,6 +137,12 @@ The moment a suite grows past what the host toolchain can express, `trybuild` is
 ```rust
 t.dependency_path("my-crate", ".");
 t.raw_manifest_lines("[features]\nfoo = []");   // for anything exotic
+```
+
+The same trade applies to the edition: there is no host manifest to read it from, so fixtures compile under edition 2024 unless you say otherwise. Set it explicitly if your crate is on an older one — a mismatch does not error, it just changes what the goldens record.
+
+```rust
+t.edition("2021");
 ```
 
 ## Requirements on fixtures
@@ -151,7 +163,7 @@ Every fixture in a run is written to the same scratch `src/main.rs`, so a run ho
 
 What remains is cargo's and rustc's own summary lines, which name the scratch crate and count the errors. Those are **classified** out rather than filtered out: every line at column 0 is matched against a known shape, and one that matches nothing is a hard error naming the line. The failure mode of a silent filter is garbage creeping into goldens; the failure mode of this is a loud, actionable message the first time cargo changes its output.
 
-Normalization is five substitutions and is meant to stay that way — every substitution is something a golden can no longer distinguish:
+Normalization is a short, fixed list of substitutions and is meant to stay that way — every substitution is something a golden can no longer distinguish:
 
 | | |
 |---|---|
@@ -160,10 +172,34 @@ Normalization is five substitutions and is meant to stay that way — every subs
 | the host manifest directory | `$DIR` |
 | an unpacked registry source directory | `$CARGO_REGISTRY` |
 | `CARGO_HOME` | `$CARGO_HOME` |
+| the toolchain's own source | `$RUST` |
+| each declared path dependency outside `$DIR` | `$NAME_OF_THE_CRATE` |
+
+`$RUST` covers all three shapes a toolchain path takes — a rustup toolchain, whose path carries both your home directory *and* the host triple, the older `src/rust/src` layout, and the `/rustc/<commit>/library` form. Any trait bound involving a std type produces one of these, so without it a golden passes only on the machine that blessed it.
+
+The last row is one rule rather than a growing list of special cases: a diagnostic is free to point into a dependency's source, and that path is absolute and machine-specific. A dependency that sits *inside* the host crate is already covered by `$DIR` and stays there. Names are uppercased with `-` becoming `_`, matching `trybuild`, so a golden that already contains `$MY_CRATE` migrates unedited.
+
+Every prefix is anchored on a path component boundary, so a sibling checkout at `../my-crate-helper` is not rewritten to `$MY_CRATE-helper`.
 
 Plus `\r\n` to `\n`, trailing whitespace stripped per line, and exactly one trailing newline.
 
+### Line numbers
+
+Only the fixture's own spans keep their `:line:col`. A span pointing anywhere else loses them, along with the line numbers in the snippet printed beneath it:
+
+```
+note: required by a bound in `take`
+ --> $MY_CORE/src/lib.rs
+  |
+  | pub fn take<T: Small>(_value: T) {}
+  |                ^^^^^ required by this bound in `take`
+```
+
+Those numbers record where a dependency happens to put its code today. Without this, adding a doc comment near the top of a dependency file re-blesses every golden whose diagnostic reaches into it, for a reason that has nothing to do with any invariant under test. `trybuild` does the same thing, for the same reason.
+
 ## Migrating from trybuild
+
+Fixtures compile under edition 2024 unless you call `t.edition(...)`, and `trybuild` inherited the edition from your manifest. If your crate is not on 2024, set it explicitly before blessing — edition 2024 is not diagnostic-neutral, so a fixture can change error code or even stop failing, which silently turns a `compile_fail` case green.
 
 Goldens are usually close but not portable verbatim, since the normalization differs. Re-bless with `NOBUILD=overwrite` and **read the diff line by line** — a migration that blesses without reading silently accepts whatever the new harness produces, including nothing at all. Then confirm the dependencies actually left with `cargo tree -i -p <each>`.
 
