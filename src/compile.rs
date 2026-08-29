@@ -207,6 +207,17 @@ pub(crate) fn build(layout: &Layout) -> io::Result<Build> {
     // above because `-D warnings` is about diagnostics themselves, which is the
     // one thing a golden is made of.
     //
+    // `CARGO_BUILD_TARGET` is deliberately not swept with them, though it
+    // reaches the goldens just as directly. It is not an incidental build knob:
+    // it says what platform the crate is for, and it is also what the test
+    // binary running this was built for, so following it is what keeps a fixture
+    // compiling the way the crate under test does. A `no_std` crate's
+    // compile-fail invariants are usually about its target -- a const guard
+    // asserting a 64-bit pointer can only be tested by building for a target
+    // that has one -- and forcing the host would quietly stop testing it.
+    // `trybuild` follows the same triple, by passing `--target` for the one it
+    // was itself compiled for.
+    //
     // Before the two set below, which the sweep would otherwise take with it.
     for key in profile_keys(env::vars_os().map(|(key, _)| key)) {
         command.env_remove(key);
@@ -436,9 +447,12 @@ mod tests {
 
     #[test]
     fn variables_that_are_not_profile_settings_are_left_alone() {
-        // `RUSTC` and `RUSTUP_TOOLCHAIN` in particular: the fixtures must be
-        // built by the same compiler as the crate under test, so identifying the
-        // toolchain is exactly the part of the environment to keep.
+        // `RUSTC`, `RUSTUP_TOOLCHAIN` and `CARGO_BUILD_TARGET` in particular:
+        // the fixtures must be built by the same compiler, for the same target,
+        // as the crate under test, so what identifies those is exactly the part
+        // of the environment to keep. Sweeping the target would compile a
+        // `no_std` crate's fixtures for the host and quietly stop testing the
+        // invariant they exist for.
         assert!(
             keys(&[
                 "CARGO",
@@ -446,6 +460,7 @@ mod tests {
                 "CARGO_PKG_NAME",
                 "RUSTC",
                 "RUSTUP_TOOLCHAIN",
+                "CARGO_BUILD_TARGET",
                 "PATH",
                 "NOT_CARGO_PROFILE_DEV_DEBUG",
             ])

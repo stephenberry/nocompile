@@ -86,9 +86,11 @@
 //! # Scope
 //!
 //! Deliberately out: running the compiled program and checking its output, glob
-//! patterns, inferring dependencies from the host manifest, cross-compilation,
-//! custom targets, `-Z` flags, and nightly-only features. The moment a suite
-//! needs any of those, `trybuild` is the answer. Windows is not supported in
+//! patterns, inferring dependencies from the host manifest, `-Z` flags, and
+//! nightly-only features. The moment a suite needs any of those, `trybuild` is
+//! the answer. Fixtures *are* built for whatever target the suite itself was
+//! built for, so a `no_std` crate can test an invariant about its own target;
+//! goldens are target-specific in the same way they are toolchain-specific. Windows is not supported in
 //! v1 -- path normalization and the `\r\n` question need someone with a Windows
 //! machine to get right, and claiming support without testing it is worse than
 //! not claiming it.
