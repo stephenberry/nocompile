@@ -12,6 +12,8 @@
 //! and summary lines never enter the stream that becomes a golden.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::env;
+use std::ffi::OsString;
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -131,6 +133,19 @@ fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// The profile keys in an environment, which a fixture build must not inherit.
+///
+/// Selected by prefix rather than by name: which keys exist is cargo's to grow,
+/// and a list written here would go quietly out of date, which for this
+/// particular list means going quietly back to the bug.
+fn profile_keys(keys: impl Iterator<Item = OsString>) -> Vec<OsString> {
+    keys.filter(|key| {
+        key.to_str()
+            .is_some_and(|key| key.starts_with("CARGO_PROFILE_"))
+    })
+    .collect()
+}
+
 /// Build every bin target of the scratch project in one invocation.
 pub(crate) fn build(layout: &Layout) -> io::Result<Build> {
     let mut command = Command::new(cargo());
@@ -176,13 +191,49 @@ pub(crate) fn build(layout: &Layout) -> io::Result<Build> {
     // `CARGO_ENCODED_RUSTFLAGS` to the empty string is what actually overrides
     // that: it sits at the top of cargo's precedence order and an empty value
     // means "no flags" rather than "unset".
+    // The scratch project's profile is this harness's to choose, the same as its
+    // manifest is. Cargo reads `CARGO_PROFILE_<profile>_<key>` from the
+    // environment, so an inherited `CARGO_PROFILE_DEV_DEBUG_ASSERTIONS=false`
+    // flips what a `#[cfg(debug_assertions)]` fixture records, and
+    // `CARGO_PROFILE_DEV_OPT_LEVEL` changes which post-monomorphization errors
+    // fire at all. That is the `-D warnings` hazard arriving through another
+    // door, and a worse one: a shell variable differs between two developers
+    // checking out the same commit, so the goldens do too.
+    //
+    // Only the environment is swept. A `[profile.dev]` in a discovered
+    // `.cargo/config.toml` is committed configuration -- the same for everyone
+    // who checks the repo out, and the way the crate under test is built
+    // anyway -- so it is left to apply. `rustflags` gets the stronger treatment
+    // above because `-D warnings` is about diagnostics themselves, which is the
+    // one thing a golden is made of.
+    //
+    // Before the two set below, which the sweep would otherwise take with it.
+    for key in profile_keys(env::vars_os().map(|(key, _)| key)) {
+        command.env_remove(key);
+    }
+
     command
         .env("CARGO_ENCODED_RUSTFLAGS", "")
         .env_remove("RUSTFLAGS")
         .env_remove("CARGO_BUILD_RUSTFLAGS")
         // `--target-dir` above already wins, but leaving this set makes the
         // effective target directory ambiguous to anyone reading a failure.
-        .env_remove("CARGO_TARGET_DIR");
+        .env_remove("CARGO_TARGET_DIR")
+        // Building rather than checking is what reaches a post-monomorphization
+        // error, and it is also what makes the scratch directory large. Debug
+        // info goes into every object file and every linked fixture, and no
+        // golden can see any of it.
+        //
+        // Set here rather than as a `[profile.dev]` in the generated manifest
+        // because an environment profile key outranks a manifest one, so raw
+        // manifest lines from the caller cannot put either back. It also
+        // survives the sweep above, which runs first.
+        .env("CARGO_PROFILE_DEV_DEBUG", "none")
+        // Incremental compilation *replays* cached diagnostics, so turning it
+        // off makes what the goldens compare come from the compiler every time.
+        // It also buys nothing here: cargo already skips a fixture whose source
+        // has not changed, and within one fixture there is nothing to reuse.
+        .env("CARGO_INCREMENTAL", "0");
 
     let output = command.output()?;
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -355,6 +406,52 @@ pub(crate) fn write_if_changed(path: &Path, contents: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn keys(names: &[&str]) -> Vec<String> {
+        profile_keys(names.iter().copied().map(OsString::from))
+            .iter()
+            .map(|key| key.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn every_profile_key_is_swept_whatever_its_profile_or_setting() {
+        assert_eq!(
+            keys(&[
+                "CARGO_PROFILE_DEV_DEBUG_ASSERTIONS",
+                "CARGO_PROFILE_DEV_OPT_LEVEL",
+                "CARGO_PROFILE_RELEASE_PANIC",
+                // Not a key this harness knows about, which is the point of
+                // matching a prefix rather than a list.
+                "CARGO_PROFILE_DEV_SOMETHING_CARGO_ADDS_LATER",
+            ]),
+            [
+                "CARGO_PROFILE_DEV_DEBUG_ASSERTIONS",
+                "CARGO_PROFILE_DEV_OPT_LEVEL",
+                "CARGO_PROFILE_RELEASE_PANIC",
+                "CARGO_PROFILE_DEV_SOMETHING_CARGO_ADDS_LATER",
+            ]
+        );
+    }
+
+    #[test]
+    fn variables_that_are_not_profile_settings_are_left_alone() {
+        // `RUSTC` and `RUSTUP_TOOLCHAIN` in particular: the fixtures must be
+        // built by the same compiler as the crate under test, so identifying the
+        // toolchain is exactly the part of the environment to keep.
+        assert!(
+            keys(&[
+                "CARGO",
+                "CARGO_HOME",
+                "CARGO_PKG_NAME",
+                "RUSTC",
+                "RUSTUP_TOOLCHAIN",
+                "PATH",
+                "NOT_CARGO_PROFILE_DEV_DEBUG",
+            ])
+            .is_empty()
+        );
+    }
 
     const OURS: &str = "/scratch/Cargo.toml";
 

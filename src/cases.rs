@@ -115,7 +115,9 @@ impl TestCases {
     /// The escape hatch for anything the typed methods do not cover -- a
     /// `[features]` table, a `[profile.dev]` override. Note that fixtures build
     /// with `--offline`, so a registry dependency added this way must already be
-    /// in the local cargo cache.
+    /// in the local cargo cache, and that `debug` and `incremental` are set for
+    /// the fixture build through the environment, which outranks a manifest
+    /// profile: a `[profile.dev]` added here cannot turn either back on.
     pub fn raw_manifest_lines(&mut self, lines: impl Into<String>) -> &mut Self {
         self.raw_manifest_lines.push(lines.into());
         self
