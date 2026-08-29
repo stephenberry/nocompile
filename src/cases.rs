@@ -351,7 +351,15 @@ impl TestCases {
         );
         if actual.trim().is_empty() {
             return Err(Failure::NoDiagnostics {
-                stderr: diagnostics,
+                // When cargo suppressed everything rustc said about this
+                // fixture there are no diagnostics left to show, and cargo's own
+                // stderr is the only remaining evidence -- it still names the
+                // target it could not compile.
+                stderr: if diagnostics.trim().is_empty() {
+                    build.stderr.clone()
+                } else {
+                    diagnostics
+                },
             });
         }
 

@@ -204,7 +204,7 @@ t.edition("2021");
 - Fixtures build with `--offline`, so a dependency must be a path dependency or already in the local cargo cache. A compile-fail suite that can reach the network is a suite that fails in CI for unrelated reasons.
 - Warnings in the fixture itself land in its golden. Warnings from a *path dependency* do not: diagnostics are attributed by target, so a dependency's own warnings stay with the dependency instead of being replayed into every fixture's golden the way `trybuild` does.
 - `RUSTFLAGS` is cleared for the fixture build, including `[build] rustflags` from any `.cargo/config.toml`. An inherited `-D warnings` would turn every fixture's warning into an error and silently change what the goldens contain.
-- A diagnostic message beginning with `aborting due to` is suppressed by **cargo itself** before any harness can see it, because that is where cargo filters rustc's own abort line. If a `compile_error!` in your crate is worded that way it will never reach a golden; word it differently.
+- **Cargo** suppresses any diagnostic whose message begins with `aborting due to`, or ends with `warning emitted` or `warnings emitted`, before any harness can see it -- that is how it strips rustc's own summary lines, and a `compile_error!` worded any of those ways is stripped with them. If it is the fixture's only error, the harness reports that rather than blessing an empty golden. If the fixture has other errors too, they are blessed and the suppressed one is silently absent, which nothing downstream of cargo can detect. Word the message differently.
 
 ## Concurrency
 

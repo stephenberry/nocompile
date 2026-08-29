@@ -47,8 +47,14 @@ pub enum Failure {
     /// A `compile_fail` fixture failed to build but produced no diagnostics the
     /// harness could attribute to it. Blessing this would write an empty golden
     /// and make the fixture permanently, silently useless.
+    ///
+    /// The usual cause is a diagnostic worded the way cargo words its own
+    /// summary lines; see the `Display` text.
     NoDiagnostics {
-        /// Raw stderr, so the cause is visible.
+        /// Whatever the harness did have: the fixture's unfiltered diagnostics
+        /// if there were any, and otherwise cargo's own stderr, which names the
+        /// target it could not compile even when it suppressed everything rustc
+        /// said about it. Either may be empty.
         stderr: String,
     },
     /// The golden does not exist. A missing golden is a failure, never an
@@ -104,11 +110,35 @@ impl Display for Failure {
                     "expected the fixture to compile, but it did not:\n\n{stderr}"
                 )
             }
-            Failure::NoDiagnostics { stderr } => write!(
-                f,
-                "the fixture failed to build but produced no diagnostics the harness could \
-                 attribute to it; refusing to write an empty golden. Raw stderr:\n\n{stderr}"
-            ),
+            Failure::NoDiagnostics { stderr } => {
+                f.write_str(
+                    "the fixture failed to build but produced no diagnostics the harness could \
+                     attribute to it; refusing to write an empty golden.\n\n\
+                     Cargo suppresses any diagnostic whose message begins with `aborting due to`, \
+                     or ends with `warning emitted` or `warnings emitted`, which is how it strips \
+                     rustc's own summary lines -- and a `compile_error!` worded any of those ways \
+                     goes with them, before any harness can see it. If that is what happened, \
+                     reword the message.",
+                )?;
+                // Only when there is something to show. A heading over nothing
+                // is what this failure used to print, and it told the reader the
+                // cause was visible when it was not.
+                //
+                // Where cargo names the rustc command it ran, that command is
+                // the recovery rather than clutter: rustc emits the diagnostic,
+                // and only cargo suppresses it.
+                if !stderr.trim().is_empty() {
+                    write!(
+                        f,
+                        "\n\ncargo said this. Where it names the rustc command it ran, running \
+                         that command with its `--error-format` and `--json` flags removed \
+                         prints the suppressed diagnostic in full -- rustc emits it, and only \
+                         cargo drops it:\n\n{}",
+                        stderr.trim_end()
+                    )?;
+                }
+                Ok(())
+            }
             Failure::MissingGolden { golden } => write!(
                 f,
                 "no golden at {}\nrun with NOCOMPILE=overwrite to create it, then read what it captured",

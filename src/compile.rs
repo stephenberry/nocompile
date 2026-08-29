@@ -32,7 +32,8 @@ pub(crate) struct Build {
     /// a path dependency that failed to build. Not attributable to any fixture,
     /// but the only description of why every fixture produced nothing.
     foreign: Vec<String>,
-    /// Cargo's own stderr. Only read when the build never started.
+    /// Cargo's own stderr. Read when the build never started, and when a fixture
+    /// failed with no diagnostics at all -- there, it is the only evidence left.
     pub(crate) stderr: String,
     /// Whether cargo got as far as building anything. False means cargo failed
     /// on its own terms -- an unparseable manifest, an unresolvable dependency
@@ -53,21 +54,24 @@ impl Build {
         self.compiled.contains(bin)
     }
 
-    /// Why nothing was built, when nothing was built.
+    /// Why nothing was built, when nothing was built *and another package said
+    /// why*.
     ///
     /// A dependency that fails to compile leaves every fixture with no
     /// diagnostics and no artifact, which on its own reads as a harness bug. The
     /// dependency's own errors say what actually happened, so they are kept
     /// aside rather than discarded for belonging to another package.
+    ///
+    /// Another package's errors are the only thing that answers this. Falling
+    /// back to cargo's stderr would also catch the case where every fixture
+    /// failed with diagnostics cargo suppressed, and report it as a failure of
+    /// the run -- but that is a property of each fixture, and saying so per
+    /// fixture is what lets the reader see which one, and act on it.
     pub(crate) fn nothing_built(&self) -> Option<String> {
         if !self.messages.is_empty() || !self.compiled.is_empty() {
             return None;
         }
-        let mut report = self.foreign.concat();
-        if report.trim().is_empty() {
-            report = self.stderr.clone();
-        }
-        let report = report.trim_end().to_string();
+        let report = self.foreign.concat().trim_end().to_string();
         (!report.is_empty()).then_some(report)
     }
 }
@@ -370,6 +374,16 @@ mod tests {
             &message("/elsewhere/Cargo.toml", "helper", "error", "error: dep\n"),
         );
         assert_eq!(build.nothing_built().as_deref(), Some("error: dep"));
+    }
+
+    /// Nothing built and no other package to blame is not a failure of the run:
+    /// it is every fixture failing with diagnostics cargo suppressed, and it is
+    /// reported on each fixture, where the reader can act on it.
+    #[test]
+    fn nothing_built_stays_quiet_when_no_other_package_explains_it() {
+        let mut build = empty();
+        build.stderr = "error: could not compile `scratch` (bin \"f_a\")\n".to_string();
+        assert_eq!(build.nothing_built(), None);
     }
 
     #[test]

@@ -888,3 +888,93 @@ fn adding_a_fixture_does_not_disturb_another_fixtures_golden() {
         "adding an unrelated fixture rewrote this one's golden"
     );
 }
+
+
+/// Cargo suppresses a diagnostic whose message begins with `aborting due to`,
+/// or ends with `warning emitted` / `warnings emitted`, on its way to reporting
+/// its own summary. A `compile_error!` worded that way is suppressed with it,
+/// and the harness never sees it.
+///
+/// Nothing can recover the message, so what is guarded is the consequence: a
+/// fixture left with no diagnostics at all must be reported, and must never be
+/// blessed into an empty golden that then matches forever while asserting
+/// nothing. The failure has to say *why*, because the cause is invisible in
+/// everything the reader can see.
+#[track_caller]
+fn assert_suppressed_wording_is_reported(name: &str, message: &str) {
+    let sandbox = Sandbox::new(name);
+    sandbox.write(
+        "ui/suppressed.rs",
+        &format!("compile_error!(\"{message}\");\n\nfn main() {{}}\n"),
+    );
+
+    let mut t = sandbox.cases();
+    t.compile_fail("ui/suppressed.rs");
+
+    // A blessing run, because blessing is where the damage would be done.
+    let outcome = t.overwrite(true).run();
+    let failure = sole_failure(&outcome);
+    assert!(
+        matches!(failure, Failure::NoDiagnostics { .. }),
+        "expected NoDiagnostics for a suppressed `{message}`, got: {failure}"
+    );
+    assert!(
+        !sandbox.path("ui/suppressed.stderr").exists(),
+        "an empty golden was blessed for a suppressed `{message}`"
+    );
+    // The reader cannot see the cause anywhere else, so the failure must name it.
+    let report = outcome.report();
+    assert!(
+        report.contains("aborting due to") && report.contains("warnings emitted"),
+        "the failure does not say what cargo suppressed:\n{report}"
+    );
+}
+
+#[test]
+fn a_fixture_whose_only_error_is_worded_like_an_abort_is_reported() {
+    assert_suppressed_wording_is_reported("abort-wording", "aborting due to a missing impl");
+}
+
+#[test]
+fn a_fixture_whose_only_error_is_worded_like_a_warning_count_is_reported() {
+    assert_suppressed_wording_is_reported("warning-count-wording", "3 warnings emitted");
+}
+
+/// The same fixture in a suite alongside a healthy one. This is the arrangement
+/// that used to differ: with other fixtures reporting diagnostics the run no
+/// longer looks like a dependency failure, so the two paths reached different
+/// verdicts about identical fixtures. Both must reach the same one.
+#[test]
+fn a_suppressed_wording_is_reported_the_same_way_beside_a_healthy_fixture() {
+    let sandbox = Sandbox::new("suppressed-beside-healthy");
+    sandbox.write(
+        "ui/suppressed.rs",
+        "compile_error!(\"aborting due to a missing impl\");\n\nfn main() {}\n",
+    );
+    sandbox.write("ui/healthy.rs", REJECTED);
+
+    let mut t = sandbox.cases();
+    t.compile_fail("ui/suppressed.rs");
+    t.compile_fail("ui/healthy.rs");
+    let outcome = t.overwrite(true).run();
+
+    assert!(
+        outcome.setup_failures().is_empty(),
+        "a fixture-level problem was reported as a failure of the run:\n{}",
+        outcome.report()
+    );
+    let failures: Vec<_> = outcome.failures().collect();
+    assert_eq!(failures.len(), 1, "expected one failure:\n{}", outcome.report());
+    assert_eq!(failures[0].path(), Path::new("ui/suppressed.rs"));
+    assert!(matches!(
+        failures[0].failure(),
+        Some(Failure::NoDiagnostics { .. })
+    ));
+
+    // The healthy fixture is unaffected: one bad fixture must not cost the run.
+    assert!(
+        sandbox.path("ui/healthy.stderr").exists(),
+        "a healthy fixture beside a suppressed one was not blessed"
+    );
+}
+

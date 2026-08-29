@@ -82,10 +82,14 @@
 //! - Warnings from the crate under test land in the fixture's stderr and so in
 //!   its golden, exactly as they do with `trybuild`. Keep the crate under test
 //!   warning-clean, or use [`Mode::Brief`].
-//! - A diagnostic message beginning with `aborting due to` is suppressed by
-//!   **cargo itself**, before any harness can see it, because cargo filters
-//!   rustc's own abort line there. If a `compile_error!` in your crate is worded
-//!   that way it will never reach a golden; word it differently.
+//! - **Cargo** suppresses any diagnostic whose message begins with `aborting
+//!   due to`, or ends with `warning emitted` or `warnings emitted`, before any
+//!   harness can see it -- that is how it strips rustc's own summary lines, and
+//!   a `compile_error!` worded any of those ways is stripped with them. If it is
+//!   the fixture's only error, the harness reports that rather than blessing an
+//!   empty golden. If the fixture has other errors too, they are blessed and the
+//!   suppressed one is silently absent, which nothing downstream of cargo can
+//!   detect. Word the message differently.
 //!
 //! # Concurrency
 //!
