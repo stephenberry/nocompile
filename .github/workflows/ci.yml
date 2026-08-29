@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs rather than let them finish. Matters while the
+# repository is private and minutes are metered.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+# No marketplace actions beyond first-party checkout. A crate whose pitch is
+# zero dependencies should not need a supply chain to test itself; rustup is
+# already on every runner.
+jobs:
+  test:
+    name: ${{ matrix.os }} / ${{ matrix.toolchain }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux is the platform this crate was never developed on, and path
+          # normalization is exactly the part that differs by machine. Runners
+          # install a minimal profile without `rust-src`, so rustc reports std
+          # spans as `/rustc/<commit>/library/...` rather than the rustup path,
+          # which exercises a normalization branch a dev machine never hits.
+          - os: ubuntu-latest
+            toolchain: stable
+          # The MSRV in Cargo.toml, verified rather than asserted.
+          - os: ubuntu-latest
+            toolchain: "1.96.0"
+          - os: macos-latest
+            toolchain: stable
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ${{ matrix.toolchain }}
+        run: |
+          rustup toolchain install ${{ matrix.toolchain }} --profile minimal
+          rustup default ${{ matrix.toolchain }}
+          rustc --version
+      # Runs the unit tests, the adversarial self-test suite, the UI suite
+      # against its committed goldens, and the doctests.
+      - run: cargo test
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup component add rustfmt clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+
+  no-dependencies:
+    name: zero dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The crate's entire pitch, as a test rather than a claim in the README.
+      # Dev-dependencies count: a `[dev-dependencies]` entry shows up in
+      # `cargo tree` for anyone auditing the source.
+      - name: cargo tree must print this crate and nothing else
+        run: |
+          tree=$(cargo tree --edges normal,build,dev --all-features)
+          printf '%s\n' "$tree"
+          count=$(printf '%s\n' "$tree" | wc -l)
+          if [ "$count" -ne 1 ]; then
+            echo "::error::nocompile gained a dependency. The crate's entire pitch is that it has none, dev-dependencies included."
+            exit 1
+          fi
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Catches a crate that builds in the working tree but not from the
+      # published tarball, which is the form everyone else receives. Subsumes
+      # `cargo package`, and also checks the metadata crates.io requires.
+      - run: cargo publish --dry-run
