@@ -31,14 +31,14 @@
 //! # Living with toolchain churn
 //!
 //! Goldens of rendered diagnostics break whenever rustc reflows a message. That
-//! is inherent to the technique, but [`Mode::Codes`] makes it much cheaper:
+//! is inherent to the technique, but [`Mode::Brief`] makes it much cheaper:
 //!
 //! ```no_run
 //! # let mut t = nocompile::cases!();
-//! t.mode(nocompile::Mode::Codes);
+//! t.mode(nocompile::Mode::Brief);
 //! ```
 //!
-//! `Codes` compares only error codes, primary messages and span headers, and
+//! `Brief` compares only error codes, primary messages and span headers, and
 //! drops the source snippets, underline art and `= note:` lines that a rustc
 //! release reflows. It still catches every regression that matters: a fixture
 //! that stops failing, or starts failing for a different reason. On one real
@@ -80,7 +80,7 @@
 //!   dependency or already in the local cargo cache.
 //! - Warnings from the crate under test land in the fixture's stderr and so in
 //!   its golden, exactly as they do with `trybuild`. Keep the crate under test
-//!   warning-clean, or use [`Mode::Codes`].
+//!   warning-clean, or use [`Mode::Brief`].
 //! - A diagnostic message beginning with `aborting due to` is suppressed by
 //!   **cargo itself**, before any harness can see it, because cargo filters
 //!   rustc's own abort line there. If a `compile_error!` in your crate is worded

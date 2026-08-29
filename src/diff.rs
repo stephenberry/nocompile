@@ -77,7 +77,7 @@ pub(crate) fn unified(
         i = run_end;
     }
 
-    // Reachable via an empty-but-present golden, or a `Codes` filter that
+    // Reachable via an empty-but-present golden, or a `Brief` filter that
     // reduces an `Exact` golden to nothing. The mirrored case -- empty `actual`
     // -- cannot occur, because `Failure::NoDiagnostics` returns before the
     // golden is read.

@@ -421,11 +421,11 @@ fn concurrent_runs_do_not_compile_each_others_fixtures() {
     });
 }
 
-/// `Codes` filters both sides, so switching modes does not force a re-bless
+/// `Brief` filters both sides, so switching modes does not force a re-bless
 /// before the suite can go green.
 #[test]
-fn codes_mode_accepts_an_exact_golden() {
-    let sandbox = Sandbox::new("codes-mode");
+fn brief_mode_accepts_an_exact_golden() {
+    let sandbox = Sandbox::new("brief-mode");
     sandbox.write("ui/rejected.rs", REJECTED);
 
     let mut t = sandbox.cases();
@@ -433,32 +433,32 @@ fn codes_mode_accepts_an_exact_golden() {
     assert_passed(&t.overwrite(true).run());
     let exact = sandbox.read("ui/rejected.stderr");
 
-    assert_passed(&t.mode(Mode::Codes).overwrite(false).run());
+    assert_passed(&t.mode(Mode::Brief).overwrite(false).run());
 
-    // Blessing in `Codes` then shrinks the golden to what it actually compares.
+    // Blessing in `Brief` then shrinks the golden to what it actually compares.
     assert_passed(&t.overwrite(true).run());
-    let codes = sandbox.read("ui/rejected.stderr");
+    let brief = sandbox.read("ui/rejected.stderr");
     assert!(
-        codes.len() < exact.len(),
-        "Codes golden was not smaller:\n{codes}"
+        brief.len() < exact.len(),
+        "Brief golden was not smaller:\n{brief}"
     );
-    assert!(codes.contains("error[E0308]: mismatched types"), "{codes}");
-    assert!(codes.contains("--> ui/rejected.rs:2:18"), "{codes}");
+    assert!(brief.contains("error[E0308]: mismatched types"), "{brief}");
+    assert!(brief.contains("--> ui/rejected.rs:2:18"), "{brief}");
     assert!(
-        !codes.contains("let _x"),
-        "Codes kept the source snippet:\n{codes}"
+        !brief.contains("let _x"),
+        "Brief kept the source snippet:\n{brief}"
     );
 }
 
-/// `Codes` must still catch a fixture that starts failing for a different
+/// `Brief` must still catch a fixture that starts failing for a different
 /// reason -- otherwise it would be trading churn for blindness.
 #[test]
-fn codes_mode_still_catches_a_changed_error() {
-    let sandbox = Sandbox::new("codes-catches");
+fn brief_mode_still_catches_a_changed_error() {
+    let sandbox = Sandbox::new("brief-catches");
     sandbox.write("ui/rejected.rs", REJECTED);
 
     let mut t = sandbox.cases();
-    t.compile_fail("ui/rejected.rs").mode(Mode::Codes);
+    t.compile_fail("ui/rejected.rs").mode(Mode::Brief);
     assert_passed(&t.overwrite(true).run());
 
     // Same fixture name, different invariant broken.

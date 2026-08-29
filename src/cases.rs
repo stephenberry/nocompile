@@ -352,7 +352,7 @@ impl TestCases {
             }
         };
 
-        // Both sides are filtered, so `Codes` mode accepts an `Exact` golden and
+        // Both sides are filtered, so `Brief` mode accepts an `Exact` golden and
         // switching modes does not force a re-bless before the suite is green.
         let expected = compare::filter(&expected, self.mode);
         if expected == actual {

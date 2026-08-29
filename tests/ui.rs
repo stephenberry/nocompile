@@ -6,16 +6,16 @@
 //! goldens and real rustc diagnostics -- which the self-test suite, whose
 //! fixtures are all written at run time, does not.
 //!
-//! The suite runs in [`Mode::Codes`] on purpose: the goldens here are committed
+//! The suite runs in [`Mode::Brief`] on purpose: the goldens here are committed
 //! and this crate is expected to build on more than one toolchain, which is the
-//! exact situation `Codes` exists for.
+//! exact situation `Brief` exists for.
 
 use nocompile::Mode;
 
 #[test]
 fn ui() {
     let mut t = nocompile::cases!();
-    t.mode(Mode::Codes);
+    t.mode(Mode::Brief);
     t.compile_fail_dir("tests/ui");
     t.pass_dir("tests/ui-pass");
     t.assert();

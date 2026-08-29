@@ -37,7 +37,7 @@ Write the goldens with `NOCOMPILE=overwrite cargo test`, then **read what they c
 Everything else is opt-in:
 
 ```rust
-t.mode(nocompile::Mode::Codes);                 // less brittle comparison, below
+t.mode(nocompile::Mode::Brief);                 // less brittle comparison, below
 t.compile_fail("tests/ui/just_this_one.rs");
 t.pass_dir("tests/ui-pass");                  // fixtures that must still compile
 t.edition("2024");
@@ -52,10 +52,10 @@ One struct, ten methods, two enums. That is the whole library.
 `.stderr` goldens break whenever rustc reflows a diagnostic. That is inherent to golden-matching rendered text, and it is the worst property of this style of test. `nocompile` cannot fix it, but it offers a cheaper mode — the one axis on which it is _better_ than the alternative rather than merely lighter:
 
 ```rust
-t.mode(nocompile::Mode::Codes);
+t.mode(nocompile::Mode::Brief);
 ```
 
-`Codes` compares only error codes, primary messages and span headers:
+`Brief` compares each diagnostic's code, primary message and location, and nothing else:
 
 ```
 error[E0061]: this function takes 2 arguments but 1 argument was supplied
@@ -85,7 +85,26 @@ help: provide the argument
 
 What it drops is entirely rustc-rendering detail — source snippets, underline art, and the `= note:` lines that a rustc release reflows. What it keeps is every error code, every primary message and every span, so it still catches every regression that matters: a fixture that stops failing, or one that starts failing for a _different_ reason. On one real 19-fixture suite it takes 436 golden lines down to 78.
 
-The filter is applied to both sides of the comparison, so an existing `Exact` golden passes in `Codes` mode unchanged. Switching is a one-line change; blessing afterwards shrinks the goldens to match.
+The filter is applied to both sides of the comparison, so an existing `Exact` golden passes in `Brief` mode unchanged. Switching is a one-line change; blessing afterwards shrinks the goldens to match.
+
+### Which mode
+
+**Use `Brief` when the goldens are committed and CI builds on more than one toolchain.** That describes most crates, and it is why this crate's own UI suite runs in `Brief`.
+
+**Use `Exact` when the rendering is the product** — a `#[diagnostic::on_unimplemented]` message, a `= help:` suggestion you wrote deliberately, a span you placed on purpose. `Brief` drops all three, so it cannot regression-test them.
+
+`Exact` stays the default: it is what `trybuild` produces, so a migrating golden matches unedited, and its failure mode is the loud one. A suite that needs re-blessing after a toolchain upgrade tells you so; a suite quietly asserting less than you think does not.
+
+### Why goldens at all
+
+Two cheaper designs look tempting and both fail:
+
+| | |
+|---|---|
+| Assert only that the fixture failed to compile | Passes when the fixture fails for a typo *in the fixture*. A compile-fail test that goes green for the wrong reason is worse than no test. |
+| Assert only the error code | `compile_error!` — how a macro reports misuse, and the most common diagnostic in the suites this crate exists for — carries **no error code at all**. A code-only comparison sees an empty string on both sides and passes vacuously. Even where codes exist, `E0277` and `E0308` are large enough buckets that a completely different failure stays inside them. |
+
+`Brief` is the smallest comparison that still asserts something, which is why it keeps the primary message rather than just the code.
 
 ## Zero dependencies, dev-dependencies included
 
@@ -149,7 +168,7 @@ t.edition("2021");
 
 - A fixture is built as a bin and compiled **verbatim**, so it must define `fn main`, as `trybuild` fixtures do. The harness does not add one: detecting a real `fn main` needs a parser, and a wrong guess writes harness-injected source into the golden under the fixture's own name. A fixture without one gets a plain `E0601`, which says what to do about it.
 - Fixtures build with `--offline`, so a dependency must be a path dependency or already in the local cargo cache. A compile-fail suite that can reach the network is a suite that fails in CI for unrelated reasons.
-- Warnings from the crate under test land in the fixture's stderr and so in its golden, exactly as they do with `trybuild`. Keep the crate under test warning-clean, or use `Mode::Codes`.
+- Warnings from the crate under test land in the fixture's stderr and so in its golden, exactly as they do with `trybuild`. Keep the crate under test warning-clean, or use `Mode::Brief`.
 - `RUSTFLAGS` is cleared for the fixture build, including `[build] rustflags` from any `.cargo/config.toml`. An inherited `-D warnings` would turn every fixture's warning into an error and silently change what the goldens contain.
 - A diagnostic message beginning with `aborting due to` is suppressed by **cargo itself** before any harness can see it, because that is where cargo filters rustc's own abort line. If a `compile_error!` in your crate is worded that way it will never reach a golden; word it differently.
 
