@@ -259,6 +259,8 @@ note: required by a bound in `take`
 
 Those numbers record where a dependency happens to put its code today. Without this, adding a doc comment near the top of a dependency file re-blesses every golden whose diagnostic reaches into it, for a reason that has nothing to do with any invariant under test. `trybuild` does the same thing, for the same reason.
 
+The gutter shrinks with them. rustc sizes it to the widest line number *anywhere* in a diagnostic, children included, so an item at line 508 in a dependency renders the **fixture's own** snippet three columns wide. Blanking the digits alone would leave that width behind, and the dependency's line count would be back in the golden through the side door — moving that item to line 1008 would re-bless every row, including the ones describing the fixture. So the gutter is re-aligned to the widest number that survived. `trybuild` writes the same shape, so a migrating golden still matches.
+
 ## Migrating from trybuild
 
 Fixtures compile under edition 2024 unless you call `t.edition(...)`, and `trybuild` inherited the edition from your manifest. If your crate is not on 2024, set it explicitly before blessing — edition 2024 is not diagnostic-neutral, so a fixture can change error code or even stop failing, which silently turns a `compile_fail` case green.
