@@ -8,6 +8,7 @@ use crate::compare::{self, Mode};
 use crate::compile;
 use crate::normalize::Normalizer;
 use crate::outcome::{CaseOutcome, Failure, Kind, Outcome};
+use crate::path::lexical_join;
 use crate::scratch::{self, Dependency, Layout};
 
 /// The environment variable that turns a run into a blessing run.
@@ -231,6 +232,14 @@ impl TestCases {
             setup.push(Failure::Cargo {
                 message: build.stderr.trim_end().to_string(),
             });
+            return Outcome::new(setup, Vec::new());
+        }
+
+        // Checked before `nothing_built`, which would otherwise answer this with
+        // the fixtures' own diagnostics presented as some other package's --
+        // every message having been filed as foreign is precisely the symptom.
+        if let Some((handed, reported)) = build.manifest_mismatch(&layout.manifest()) {
+            setup.push(Failure::ManifestMismatch { handed, reported });
             return Outcome::new(setup, Vec::new());
         }
 
@@ -516,39 +525,6 @@ fn golden_path(fixture: &Path) -> PathBuf {
     fixture.with_extension("stderr")
 }
 
-/// Resolve `path` against `base`, folding away `.` and `..` textually so the
-/// generated manifest and the reports read cleanly. Not a canonicalization: no
-/// symlink is followed, because `CARGO_MANIFEST_DIR` is not canonical either and
-/// the two must stay comparable for normalization to match.
-fn lexical_join(base: &Path, path: &Path) -> PathBuf {
-    let joined = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        base.join(path)
-    };
-
-    let mut out = PathBuf::new();
-    for component in joined.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                // Only fold a `..` that has a real directory name to cancel.
-                let can_pop = out
-                    .components()
-                    .next_back()
-                    .is_some_and(|c| matches!(c, Component::Normal(_)));
-                if can_pop {
-                    out.pop();
-                } else {
-                    out.push("..");
-                }
-            }
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
-}
-
 /// `path` as seen from `base`, with `/` separators. Falls back to the full path
 /// when it is not under `base`, which keeps the message useful rather than
 /// truncating it to a bare file name.
@@ -578,30 +554,6 @@ mod tests {
         assert_eq!(
             golden_path(Path::new("tests/ui/a.rs")),
             Path::new("tests/ui/a.stderr")
-        );
-    }
-
-    #[test]
-    fn lexical_join_folds_parent_components() {
-        assert_eq!(
-            lexical_join(Path::new("/w/crate"), Path::new("..")),
-            Path::new("/w")
-        );
-        assert_eq!(
-            lexical_join(Path::new("/w/crate"), Path::new("../other")),
-            Path::new("/w/other")
-        );
-        assert_eq!(
-            lexical_join(Path::new("/w"), Path::new("./tests/ui")),
-            Path::new("/w/tests/ui")
-        );
-    }
-
-    #[test]
-    fn lexical_join_keeps_absolute_paths() {
-        assert_eq!(
-            lexical_join(Path::new("/w"), Path::new("/elsewhere")),
-            Path::new("/elsewhere")
         );
     }
 

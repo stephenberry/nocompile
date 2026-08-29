@@ -20,6 +20,8 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
+use crate::path::lexical_join;
+
 /// The package name of the generated project. It appears only in cargo's own
 /// own error lines, which carry no fixture attribution and so reach no golden.
 pub(crate) const CRATE_NAME: &str = "nocompile-scratch";
@@ -71,27 +73,31 @@ impl Layout {
 /// workspace (where the target directory is at the workspace root, not the
 /// member) and a `--target <triple>` build (where an extra component sits
 /// between the profile directory and the target directory).
+///
+/// Every result is folded through [`lexical_join`], which is load-bearing here
+/// rather than cosmetic: the manifest path under this directory is what every
+/// diagnostic is attributed by, and a `..` left in it is a `..` cargo folds away
+/// before reporting it back. See that function for what the mismatch costs. A
+/// relative `CARGO_TARGET_DIR` of `../shared-target` is the ordinary way to
+/// acquire one.
 fn target_dir(manifest_dir: &Path) -> PathBuf {
+    // `lexical_join` ignores its base for an absolute path, so both spellings of
+    // the variable are handled by resolving against the working directory.
     if let Some(dir) = env::var_os("CARGO_TARGET_DIR") {
-        let dir = PathBuf::from(dir);
-        return if dir.is_absolute() {
-            dir
-        } else {
-            env::current_dir()
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join(dir)
-        };
+        let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        return lexical_join(&cwd, Path::new(&dir));
     }
 
-    if let Ok(exe) = env::current_exe() {
-        for ancestor in exe.ancestors().skip(1) {
-            if ancestor.join("CACHEDIR.TAG").is_file() {
-                return ancestor.to_path_buf();
-            }
-        }
-    }
-
-    manifest_dir.join("target")
+    let tagged = env::current_exe().ok().and_then(|exe| {
+        exe.ancestors()
+            .skip(1)
+            .find(|ancestor| ancestor.join("CACHEDIR.TAG").is_file())
+            .map(Path::to_path_buf)
+    });
+    lexical_join(
+        manifest_dir,
+        &tagged.unwrap_or_else(|| manifest_dir.join("target")),
+    )
 }
 
 /// Keep a package name usable as a single path component.
@@ -260,6 +266,8 @@ fn toml_string(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Component;
+
     use super::*;
 
     #[test]
@@ -378,6 +386,22 @@ mod tests {
         assert_eq!(l.target, l.root.join("target"));
         assert!(l.project.starts_with(&l.root) && l.target.starts_with(&l.root));
         assert_ne!(l.project, l.target);
+    }
+
+    /// Whatever branch it came from, nothing under the layout carries a `..` for
+    /// cargo to disagree with. The folding itself is `lexical_join`'s, and is
+    /// tested there; this is the end-to-end invariant that it is actually
+    /// applied.
+    #[test]
+    fn a_layout_never_carries_a_parent_component() {
+        let l = Layout::new(Path::new("/w/crate/../crate"), "host");
+        assert!(
+            !l.manifest()
+                .components()
+                .any(|c| matches!(c, Component::ParentDir)),
+            "{}",
+            l.manifest().display()
+        );
     }
 
     #[test]

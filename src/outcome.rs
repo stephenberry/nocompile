@@ -90,6 +90,16 @@ pub enum Failure {
         /// Cargo's own message.
         message: String,
     },
+    /// Cargo reported its messages against a path that names the scratch
+    /// project's manifest differently from the path the harness handed it.
+    /// Attribution is by that path, so this detaches every message from every
+    /// fixture at once, and no fixture-level failure describes it.
+    ManifestMismatch {
+        /// The manifest path the harness gave cargo.
+        handed: PathBuf,
+        /// The path cargo reported back. A different spelling of `handed`.
+        reported: PathBuf,
+    },
     /// The harness could not read or write a file.
     Io {
         /// What it was trying to do.
@@ -175,6 +185,23 @@ impl Display for Failure {
             Failure::Cargo { message } => {
                 write!(f, "cargo could not run the fixture build:\n\n{message}")
             }
+            Failure::ManifestMismatch { handed, reported } => write!(
+                f,
+                "cargo reported every message against a different spelling of the scratch \
+                 project's manifest path, so none of them could be attributed to a fixture.\n\n\
+                 \x20   handed to cargo: {}\n\
+                 \x20   reported back:   {}\n\n\
+                 Both name the same file, so this is a difference of spelling rather than of \
+                 location: a normalization cargo applies that the harness does not. \
+                 Attribution compares the two as paths, and it has to -- target names are not \
+                 a namespace, so a dependency is free to have a target named like a fixture's \
+                 bin.\n\n\
+                 Setting CARGO_TARGET_DIR to an absolute path is the workaround. The mismatch \
+                 itself is a bug in this harness, and the two paths above are what it needs to \
+                 be reported.",
+                handed.display(),
+                reported.display()
+            ),
             Failure::Io { context, message } => write!(f, "{context}: {message}"),
         }
     }

@@ -11,10 +11,10 @@
 //! twice: the attribution is exact rather than inferred, and cargo's own status
 //! and summary lines never enter the stream that becomes a golden.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::json;
@@ -32,6 +32,11 @@ pub(crate) struct Build {
     /// a path dependency that failed to build. Not attributable to any fixture,
     /// but the only description of why every fixture produced nothing.
     foreign: Vec<String>,
+    /// Every manifest path cargo attributed a message to that was not the
+    /// scratch project's, deduplicated. Kept for one specific failure: cargo
+    /// naming the scratch project itself by a path that does not compare equal
+    /// to the one the harness handed it. See [`Build::manifest_mismatch`].
+    other_manifests: BTreeSet<String>,
     /// Cargo's own stderr. Read when the build never started, and when a fixture
     /// failed with no diagnostics at all -- there, it is the only evidence left.
     pub(crate) stderr: String,
@@ -73,6 +78,56 @@ impl Build {
         }
         let report = self.foreign.concat().trim_end().to_string();
         (!report.is_empty()).then_some(report)
+    }
+
+    /// The scratch project's own messages arriving under a path that does not
+    /// compare equal to the one the harness handed cargo.
+    ///
+    /// Attribution is by manifest path, and it has to be: target names are not a
+    /// namespace, so a declared dependency is free to have a target named like a
+    /// fixture's bin. The comparison is textual, so a path that names the same
+    /// file by a different spelling detaches *every* message from *every*
+    /// fixture at once. What the reader is then told is that no fixture produced
+    /// any diagnostics, or -- worse, since the messages land in `foreign` --
+    /// that cargo could not run the build, followed by the fixtures' own errors
+    /// presented as some other package's. Neither points anywhere near the
+    /// cause.
+    ///
+    /// [`lexical_join`] removes the one spelling this crate is known to
+    /// generate, an unfolded `..`. No input reaches here today -- cargo does not
+    /// resolve symlinks in `manifest_path`, so that is not a second way in --
+    /// and the guard exists for the class rather than for a known case: cargo's
+    /// path normalization is undocumented, and if it changes, this names the
+    /// cause instead of leaving the harness to misattribute it.
+    ///
+    /// Returns the path handed to cargo and the one cargo reported back.
+    ///
+    /// [`lexical_join`]: crate::path::lexical_join
+    pub(crate) fn manifest_mismatch(&self, ours: &Path) -> Option<(PathBuf, PathBuf)> {
+        // A single mismatch detaches everything, so anything attributed at all
+        // rules it out -- and this is also what keeps the two `canonicalize`
+        // calls below off the path of a run that is going fine.
+        if !self.messages.is_empty() || !self.compiled.is_empty() {
+            return None;
+        }
+        let theirs = self
+            .other_manifests
+            .iter()
+            .find(|path| same_file(Path::new(path), ours))?;
+        Some((ours.to_path_buf(), PathBuf::from(theirs)))
+    }
+}
+
+/// Whether two paths name one file, spelled differently.
+///
+/// Only asked once a run has already failed, so the two `canonicalize` calls do
+/// not sit in the way of a passing one. A path that cannot be canonicalized is
+/// not a match: the question is whether these are the same file, and an error is
+/// not a yes.
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
     }
 }
 
@@ -135,17 +190,47 @@ pub(crate) fn build(layout: &Layout) -> io::Result<Build> {
         messages: HashMap::new(),
         compiled: HashSet::new(),
         foreign: Vec::new(),
+        other_manifests: BTreeSet::new(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         started: false,
     };
 
-    let manifest = layout.manifest();
+    ingest(&mut build, &stdout, &layout.manifest())?;
+    Ok(build)
+}
+
+/// How a cargo message opens. Cargo puts `reason` first in every one it emits,
+/// and this is only used to find a message that is *not* at the start of its
+/// line, so a false negative costs nothing that was not already lost.
+const MESSAGE_OPENING: &str = r#"{"reason":"#;
+
+/// Sort one invocation's stdout into `build`.
+fn ingest(build: &mut Build, stdout: &str, manifest: &Path) -> io::Result<()> {
     for line in stdout.lines() {
         // Cargo forwards anything the compiler or a proc macro writes to stdout
         // into this stream verbatim. A `println!` while debugging a derive is
         // routine, and it is not cargo's JSON: skip it rather than fail the run
         // over output that has nothing to do with the fixtures.
+        //
+        // Skipping a whole line is only safe while cargo's own messages stay on
+        // lines of their own, and cargo does not document that. Checked against
+        // cargo 1.98: output forwarded without a trailing newline is terminated
+        // rather than run into a message. Rather than rest on that, a message
+        // found further along a line is read from where it begins -- a
+        // diagnostic silently missing from a golden is too quiet a failure to
+        // leave to an undocumented behaviour staying put.
+        //
+        // A tail that does not parse means this was ordinary output that merely
+        // looked like a message, and it is skipped as any other line would be.
+        // Guessing no further than "this parses as a whole cargo message" is
+        // what keeps a proc macro's debug print from failing the run.
         if !line.starts_with('{') {
+            let recovered = line
+                .find(MESSAGE_OPENING)
+                .and_then(|at| json::parse(&line[at..]).ok());
+            if let Some(message) = recovered {
+                absorb(build, &message, manifest);
+            }
             continue;
         }
         // A line that opens like a cargo message but will not parse is a
@@ -154,10 +239,9 @@ pub(crate) fn build(layout: &Layout) -> io::Result<Build> {
         let message = json::parse(line).map_err(|error| {
             io::Error::other(format!("could not parse cargo's JSON output: {error}"))
         })?;
-        absorb(&mut build, &message, &manifest);
+        absorb(build, &message, manifest);
     }
-
-    Ok(build)
+    Ok(())
 }
 
 /// File one cargo message under the target it belongs to.
@@ -173,9 +257,18 @@ fn absorb(build: &mut Build, message: &json::Value, manifest: &Path) {
     let Some(reason) = message.path_str(&["reason"]) else {
         return;
     };
-    let ours = message
-        .path_str(&["manifest_path"])
-        .is_some_and(|path| Path::new(path) == manifest);
+    let declared = message.path_str(&["manifest_path"]);
+    let ours = declared.is_some_and(|path| Path::new(path) == manifest);
+    // Every package the run heard from but ours, so that a mismatch between two
+    // spellings of our own manifest can be told apart from a genuine other
+    // package. Bounded by the number of packages in the build, and checked
+    // before inserting so that a dependency emitting many diagnostics does not
+    // allocate its path once per line.
+    if let (false, Some(path)) = (ours, declared)
+        && !build.other_manifests.contains(path)
+    {
+        build.other_manifests.insert(path.to_string());
+    }
     let target = message.path_str(&["target", "name"]);
 
     match reason {
@@ -270,6 +363,7 @@ mod tests {
             messages: HashMap::new(),
             compiled: HashSet::new(),
             foreign: Vec::new(),
+            other_manifests: BTreeSet::new(),
             stderr: String::new(),
             started: false,
         }
@@ -415,5 +509,167 @@ mod tests {
         feed(&mut build, r#"{"reason":"build-script-executed"}"#);
         feed(&mut build, r#"{"no-reason-at-all":1}"#);
         assert!(build.messages.is_empty() && build.compiled.is_empty());
+    }
+
+    /// A real `Cargo.toml` for the two spellings below to canonicalize to.
+    ///
+    /// Under the target directory rather than the system temp directory, which
+    /// is where the rest of this crate's scratch state lives, and named per test
+    /// because `cargo test` runs them in parallel.
+    fn scratch_manifest(name: &str) -> PathBuf {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("nocompile-unittest")
+            .join(name)
+            .join("project");
+        std::fs::create_dir_all(&dir).expect("create the scratch project directory");
+        let manifest = dir.join("Cargo.toml");
+        std::fs::write(&manifest, "[package]\n").expect("write the scratch manifest");
+        manifest
+    }
+
+    /// Attribution compares manifest paths textually, so two spellings of one
+    /// file detach every message from every fixture at once. What that used to
+    /// look like was a suite in which nothing built and the fixtures' own errors
+    /// were reported as another package's -- an answer that pointed nowhere near
+    /// the cause.
+    #[test]
+    fn one_manifest_under_two_spellings_is_recognized() {
+        let ours = scratch_manifest("mismatch");
+        // The same file by a path cargo would fold away. `..` is the spelling a
+        // relative `CARGO_TARGET_DIR` used to produce.
+        let theirs = ours
+            .parent()
+            .unwrap()
+            .join("..")
+            .join("project")
+            .join("Cargo.toml");
+
+        let mut build = empty();
+        let line = message(&theirs.display().to_string(), "f_a", "error", "error: x\n");
+        let parsed = json::parse(&line).expect("valid cargo json");
+        absorb(&mut build, &parsed, &ours);
+
+        let (handed, reported) = build.manifest_mismatch(&ours).expect("a mismatch");
+        assert_eq!(handed, ours);
+        assert_eq!(reported, theirs);
+    }
+
+    /// The mismatch is a claim about *our* manifest, so a package that really is
+    /// somewhere else must not be mistaken for one. Otherwise a dependency that
+    /// fails to build -- the case `nothing_built` exists for -- would be
+    /// reported as a harness bug.
+    #[test]
+    fn another_packages_manifest_is_not_a_mismatch() {
+        // No file needs to exist here: neither path canonicalizes, and
+        // `same_file` answers no rather than treating two failures as a match.
+        let ours = Path::new(OURS);
+        let mut build = empty();
+        feed(
+            &mut build,
+            &message("/elsewhere/Cargo.toml", "dep", "error", "e\n"),
+        );
+        assert_eq!(build.manifest_mismatch(ours), None);
+    }
+
+    /// Anything attributed at all rules the mismatch out: a single spelling
+    /// difference detaches everything, so a run with attributed messages cannot
+    /// be one.
+    #[test]
+    fn a_mismatch_is_not_claimed_when_something_was_attributed() {
+        let ours = scratch_manifest("attributed");
+        let theirs = ours
+            .parent()
+            .unwrap()
+            .join("..")
+            .join("project")
+            .join("Cargo.toml");
+
+        let mut build = empty();
+        for line in [
+            message(&theirs.display().to_string(), "f_a", "error", "error: x\n"),
+            message(&ours.display().to_string(), "f_b", "error", "error: y\n"),
+        ] {
+            let parsed = json::parse(&line).expect("valid cargo json");
+            absorb(&mut build, &parsed, &ours);
+        }
+        assert_eq!(build.manifest_mismatch(&ours), None);
+    }
+
+    /// Cargo forwards anything a proc macro prints to stdout into this stream.
+    /// Those lines are not cargo's JSON and are skipped, which is right: a
+    /// `println!` left in a derive has nothing to do with the fixtures, and the
+    /// messages around it are still read.
+    #[test]
+    fn a_line_that_is_not_cargos_json_is_skipped() {
+        let mut build = empty();
+        let stdout = format!(
+            "debugging my derive\n{}\nnoise: {{not a message\n",
+            message(OURS, "f_a", "error", "error: x\n")
+        );
+        ingest(&mut build, &stdout, Path::new(OURS)).expect("cargo json still parses");
+        assert_eq!(build.diagnostics("f_a"), "error: x\n");
+    }
+
+    /// Skipping a whole line is only safe while cargo keeps its own messages on
+    /// lines of their own, which cargo does not document. Cargo 1.98 terminates
+    /// forwarded output that has no trailing newline, so this does not arise --
+    /// but a diagnostic silently missing from a golden is what it would cost,
+    /// which is too quiet a failure to leave to an undocumented behaviour
+    /// staying put. The message is read from where it begins instead.
+    #[test]
+    fn a_message_with_something_in_front_of_it_is_still_read() {
+        let mut build = empty();
+        let stdout = format!("hi{}\n", message(OURS, "f_a", "error", "error: x\n"));
+        ingest(&mut build, &stdout, Path::new(OURS)).expect("the buried message parses");
+        assert_eq!(build.diagnostics("f_a"), "error: x\n");
+    }
+
+    /// Recovery goes no further than "the rest of this line is a whole cargo
+    /// message". Anything less is ordinary output that happened to look like
+    /// one, and failing the run over a proc macro's debug print would be a worse
+    /// answer than the skip it replaced.
+    #[test]
+    fn output_that_only_resembles_a_message_is_skipped_rather_than_failing() {
+        let mut build = empty();
+        for line in [
+            "pm debug: {\"reason\":\"compiler-message\"} and then some prose\n",
+            "pm debug: {\"reason\":\n",
+            "pm debug: {\"reason\":\"build-finished\",\"success\":true}\n",
+        ] {
+            ingest(&mut build, line, Path::new(OURS)).expect("not a failure of the run");
+        }
+        // The third line *is* a whole message, and an unknown-shaped one is
+        // ignored the same way it would be at the start of a line -- but a proc
+        // macro could forge one, exactly as it could by printing it unprefixed.
+        // `manifest_path` is what guards attribution, here as everywhere.
+        assert!(build.messages.is_empty() && build.compiled.is_empty());
+    }
+
+    /// The check looks for a cargo message, not for a brace, so ordinary output
+    /// that happens to contain JSON-ish text is still skipped quietly.
+    #[test]
+    fn other_text_that_is_not_a_message_is_still_skipped() {
+        let mut build = empty();
+        ingest(
+            &mut build,
+            "look: {\"a\":1} and {\"level\":\"error\"}\n",
+            Path::new(OURS),
+        )
+        .expect("nothing here is a cargo message");
+        assert!(build.messages.is_empty());
+    }
+
+    /// A line that opens like a cargo message but will not parse is a different
+    /// matter: the alternative to failing is a silently short golden.
+    #[test]
+    fn a_broken_cargo_message_still_fails_the_run() {
+        let mut build = empty();
+        let error = ingest(&mut build, "{\"reason\":\n", Path::new(OURS))
+            .expect_err("should not be guessed at");
+        assert!(
+            error.to_string().contains("could not parse cargo's JSON"),
+            "{error}"
+        );
     }
 }

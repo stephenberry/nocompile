@@ -109,6 +109,7 @@ mod diff;
 mod json;
 mod normalize;
 mod outcome;
+mod path;
 mod scratch;
 
 pub use crate::cases::{OVERWRITE_VAR, TestCases};
