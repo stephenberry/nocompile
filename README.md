@@ -183,6 +183,10 @@ All fixtures build in one invocation, in parallel. Measured here on 10 cores, 20
 
 The gap is mostly parallelism rather than process startup, which is only about 20 ms an invocation: a fixture-at-a-time loop leaves every core but one idle. The win therefore grows with both fixture count and core count.
 
+### Disk
+
+Building rather than checking ([why](#build-not-check)) costs scratch space: codegen and linking leave a linked binary per fixture where a check leaves none. Debug info and incremental compilation are both turned off for the fixture build — neither is observable in a diagnostic, and together they were 59% of the scratch directory on this crate's own suite (23 MB down to 9.5 MB). What remains scales with fixture count, so budget for it on a large suite.
+
 ## Declared dependencies, not inferred ones
 
 `nocompile` writes the scratch project's manifest instead of reading yours. That removes both a TOML parser and a `cargo metadata` invocation, and it is also tighter: inference hands every fixture every dev-dependency of the host crate, so a fixture can quietly lean on something the invariant under test never mentions. Explicit is both cheaper and stricter. In the common case it is one line.
@@ -214,6 +218,24 @@ Every fixture in a run is written into the same scratch project, so a run holds 
 ## How it works
 
 Every fixture becomes a `[[bin]]` target of one generated scratch project, and a single `cargo build --bins --keep-going` compiles them all. Because the fixtures are independent crates, cargo compiles them **in parallel**, which a fixture-at-a-time loop cannot do at all.
+
+### Build, not check
+
+The scratch project is compiled with `cargo build`, not `cargo check`. `check` stops after analysis, and a whole class of compile-time guard only fires during codegen — a `const { assert!(...) }` inside a generic function is evaluated once per monomorphization, so nothing evaluates it until something instantiates it:
+
+```rust
+pub fn split<const N: usize>() {
+    const { assert!(N.is_power_of_two(), "N must be a power of two") };
+}
+
+fn main() {
+    split::<3>();          // the guard fires here, and only when codegen reaches it
+}
+```
+
+`cargo check` compiles that file without a word. `cargo build` fails it with `error[E0080]: evaluation panicked: N must be a power of two` — the guard's own message, which is exactly what the golden should record. `trybuild` runs `cargo check` unless the suite also contains a `pass` fixture, so a check-only compile-fail suite passes a fixture like this silently, asserting nothing.
+
+`tests/ui/const_guard_fires_at_monomorphization.rs` is that case, kept in this crate's own suite so the choice cannot be undone by accident. The cost is disk, above.
 
 Parallel compilation interleaves diagnostics, so the output has to say which target each one came from. `--message-format=json` does; plain stderr does not. So `nocompile` reads cargo's JSON and files each `rendered` diagnostic under its `target.name`. `rendered` is byte-for-byte what plain stderr would have printed — cargo renders it and the JSON carries the same string — so the goldens are unchanged by this.
 

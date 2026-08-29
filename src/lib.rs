@@ -45,6 +45,29 @@
 //! that stops failing, or starts failing for a different reason. On this crate's
 //! own UI suite it takes 33 golden lines down to 7.
 //!
+//! # Build, not check
+//!
+//! Fixtures are compiled with `cargo build` rather than `cargo check`, which
+//! reaches a class of guard `check` never evaluates. A `const { assert!(..) }`
+//! inside a generic function runs once per monomorphization, so nothing
+//! evaluates it until something instantiates it:
+//!
+//! ```compile_fail
+//! pub fn split<const N: usize>() {
+//!     const { assert!(N.is_power_of_two(), "N must be a power of two") };
+//! }
+//!
+//! split::<3>();
+//! ```
+//!
+//! `cargo check` compiles that without a word; `cargo build` fails it with
+//! `E0080: evaluation panicked: N must be a power of two`, the guard's own
+//! message. `trybuild` runs `cargo check` unless the suite also contains a
+//! `pass` fixture, so a check-only compile-fail suite passes a fixture like this
+//! one silently. The cost is scratch disk: codegen and linking leave a binary
+//! per fixture. Debug info and incremental compilation are turned off for that
+//! build, since neither is observable in a diagnostic.
+//!
 //! # Zero dependencies, dev-dependencies included
 //!
 //! This crate depends on nothing but `std`, and it has no dev-dependencies
