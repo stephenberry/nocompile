@@ -83,7 +83,7 @@ help: provide the argument
   |                ++++++++++
 ```
 
-What it drops is entirely rustc-rendering detail — source snippets, underline art, and the `= note:` lines that a rustc release reflows. What it keeps is every error code, every primary message and every span, so it still catches every regression that matters: a fixture that stops failing, or one that starts failing for a _different_ reason. On this crate's own UI suite it takes 33 golden lines down to 7; the single diagnostic above goes from 15 lines to 3. Re-bless your own suite both ways to see the ratio you would get.
+What it drops is entirely rustc-rendering detail — source snippets, underline art, and the `= note:` lines that a rustc release reflows. What it keeps is every error code, every primary message and every span, so it still catches every regression that matters: a fixture that stops failing, or one that starts failing for a _different_ reason. A message printed over more than one line is kept whole: a `compile_error!` containing a `\n` is split where its author split it, not where a rustc release chose to, so it is part of the assertion. On this crate's own UI suite it takes 33 golden lines down to 7; the single diagnostic above goes from 15 lines to 3. Re-bless your own suite both ways to see the ratio you would get.
 
 The filter is applied to both sides of the comparison, so an existing `Exact` golden passes in `Brief` mode unchanged. Switching is a one-line change; blessing afterwards shrinks the goldens to match.
 

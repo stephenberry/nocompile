@@ -1,0 +1,3 @@
+error: MYLIB-E002: expected a struct with named fields
+       help: derive on a struct, not an enum
+--> tests/ui/multi_line_message.rs:8:1

@@ -33,7 +33,9 @@ pub enum Mode {
     /// Drops the source snippet, the underline art, and the `= note:` / `= help:`
     /// lines -- exactly the parts a rustc release reflows. What survives is the
     /// assertion itself, so a fixture that stops failing, or starts failing for a
-    /// *different* reason, still fails the test.
+    /// *different* reason, still fails the test. A message rustc printed over
+    /// more than one line survives whole: those lines are split where their
+    /// author split them, not where a rustc release chose to.
     ///
     /// Note this is not "error codes only". The primary message is kept in full,
     /// which is the point: `compile_error!` -- how a macro reports misuse, and so
@@ -75,6 +77,10 @@ pub(crate) fn filter(text: &str, mode: Mode) -> String {
 
 fn brief(text: &str) -> String {
     let mut out = String::new();
+    // Whether the last line kept was a primary message, so an indented line
+    // arriving now is the rest of it rather than the top of a snippet.
+    let mut in_message = false;
+
     for line in text.lines() {
         let trimmed = line.trim_start();
         // A span header. The gutter width in front of it tracks the largest line
@@ -84,6 +90,7 @@ fn brief(text: &str) -> String {
             out.push_str("--> ");
             out.push_str(span.trim());
             out.push('\n');
+            in_message = false;
             continue;
         }
         // A primary message: the level, an optional error code, and the text.
@@ -93,7 +100,21 @@ fn brief(text: &str) -> String {
         {
             out.push_str(line.trim_end());
             out.push('\n');
+            in_message = true;
+            continue;
         }
+        // The rest of a message that carries a newline, which rustc indents to
+        // the width of the level prefix. This is the author's own text, split
+        // where the author split it -- a `compile_error!` written on more than
+        // one line -- so it is part of the assertion rather than something a
+        // rustc release reflows, and dropping it would let two fixtures whose
+        // messages differ only after the first line compare equal.
+        if in_message && line.starts_with([' ', '\t']) && !trimmed.is_empty() {
+            out.push_str(line.trim_end());
+            out.push('\n');
+            continue;
+        }
+        in_message = false;
     }
     out
 }
@@ -144,6 +165,47 @@ error: aborting due to 1 previous error
         let narrow = filter("error: x\n --> a.rs:4:1\n", Mode::Brief);
         let wide = filter("error: x\n     --> a.rs:4:1\n", Mode::Brief);
         assert_eq!(narrow, wide);
+    }
+
+    const MULTI_LINE: &str = "\
+error: MYLIB-E001: expected a struct with named fields
+       found a tuple struct
+ --> tests/ui/a.rs:6:9
+  |
+6 |     derive_it!();
+  |     ^^^^^^^^^^^^
+  |
+  = note: this error originates in the macro `derive_it`
+";
+
+    #[test]
+    fn brief_keeps_a_message_rustc_printed_over_more_than_one_line() {
+        // The author's own text, split where the author split it. Dropping the
+        // tail would let two fixtures whose messages differ only after the first
+        // line compare equal, which for a macro reporting misuse is most of what
+        // the golden was for.
+        assert_eq!(
+            filter(MULTI_LINE, Mode::Brief),
+            concat!(
+                "error: MYLIB-E001: expected a struct with named fields\n",
+                "       found a tuple struct\n",
+                "--> tests/ui/a.rs:6:9\n",
+            )
+        );
+    }
+
+    #[test]
+    fn brief_on_a_multi_line_message_is_idempotent() {
+        let once = filter(MULTI_LINE, Mode::Brief);
+        assert_eq!(filter(&once, Mode::Brief), once);
+    }
+
+    #[test]
+    fn brief_stops_keeping_indented_lines_at_the_span_header() {
+        // The snippet rows are indented too, and they are exactly what `Brief`
+        // exists to drop. Only the run between the message and its span header
+        // is the message.
+        assert!(!filter(MULTI_LINE, Mode::Brief).contains("derive_it!();"));
     }
 
     #[test]
