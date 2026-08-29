@@ -1,0 +1,4 @@
+error[E0080]: evaluation panicked: N must be a power of two
+--> tests/ui/const_guard_fires_at_monomorphization.rs:8:13
+--> tests/ui/const_guard_fires_at_monomorphization.rs:8:5
+--> tests/ui/const_guard_fires_at_monomorphization.rs:12:5

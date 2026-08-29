@@ -22,6 +22,13 @@
 //! adding a doc comment near the top of a dependency file would otherwise
 //! re-bless every golden whose diagnostic reaches into it, for a reason that has
 //! nothing to do with the invariant under test.
+//!
+//! Blanking the digits is not enough on its own. rustc sizes the gutter to the
+//! widest line number *anywhere* in a diagnostic, so a dependency's line number
+//! also sets the width of the fixture's own snippet rows, and blanking leaves
+//! that width behind. The gutter is re-aligned to the widest number that
+//! survives, so what a golden records is the fixture's line numbers and nothing
+//! else's.
 
 use crate::scratch::Dependency;
 use std::env;
@@ -131,6 +138,10 @@ impl Normalizer {
 
             lines.push(line);
         }
+
+        // Last, because it is the blanking above that frees the width it
+        // reclaims.
+        realign_gutters(&mut lines);
 
         let mut out = lines.join("\n");
         while out.ends_with('\n') {
@@ -321,6 +332,277 @@ fn is_snippet_row(line: &str) -> bool {
         line.trim_start().chars().next(),
         Some('0'..='9' | '|' | '.')
     )
+}
+
+/// Re-align each diagnostic's gutter to the widest line number left in it.
+///
+/// rustc sizes a diagnostic's gutter to the widest line number *anywhere* in it,
+/// children included. A span reaching into a dependency at line 508 therefore
+/// renders the fixture's own snippet three columns wide, and blanking those
+/// digits leaves the width behind -- which puts the dependency's line count back
+/// into the golden through the side door, on the rows describing the fixture.
+/// Moving that item to line 1008 would re-bless every row of the golden, which
+/// is the churn the blanking exists to prevent. Shrinking the gutter to what the
+/// surviving numbers need closes it, and is what `trybuild` writes, so a
+/// migrating golden still matches.
+///
+/// The cut is the smallest any row in the block permits, so it is safe by
+/// construction: every row moves by the same amount and none moves further than
+/// its own padding allows. Misjudging a block's extent therefore cuts too little
+/// rather than misaligning, which is why an unrecognized row disqualifies its
+/// block instead of truncating it -- half a diagnostic moved is the one outcome
+/// worse than none of it.
+fn realign_gutters(lines: &mut [String]) {
+    let rows = classify(lines);
+    let mut index = 0;
+
+    while index < rows.len() {
+        let Some(mut end) = span_header(lines, &rows, index) else {
+            index += 1;
+            continue;
+        };
+
+        // The span header is itself a gutter row, so this always sets `cut`.
+        let mut cut = usize::MAX;
+        while end < rows.len() {
+            match rows[end] {
+                Row::Gutter { allowed, .. } => cut = cut.min(allowed),
+                Row::Fixed | Row::Continuation => {}
+                Row::Heading | Row::Blank => break,
+                // A row this does not recognize could be one the gutter places,
+                // and moving everything around it would misalign the block. A
+                // cut of zero is what "leave every row alone" already means.
+                Row::Other => {
+                    cut = 0;
+                    break;
+                }
+            }
+            end += 1;
+        }
+
+        if cut > 0 {
+            for (line, row) in lines[index + 1..end].iter_mut().zip(&rows[index + 1..end]) {
+                match row {
+                    Row::Gutter { from, .. } => shrink(line, *from, cut),
+                    Row::Continuation => shrink(line, 0, cut),
+                    Row::Heading | Row::Fixed | Row::Blank | Row::Other => {}
+                }
+            }
+        }
+
+        // Not `end + 1`: the row that closed the block may be the next heading.
+        index = end;
+    }
+}
+
+/// The index of the span header opening a block at `index`, if there is one.
+///
+/// rustc prints a diagnostic's whole message before its span header, and puts
+/// any line after the first at the width of the level prefix -- seven columns
+/// for `error: `, fourteen for `error[E0277]: `. That indent tracks the prefix
+/// rather than the gutter, so those rows are skipped here and never moved.
+///
+/// Requiring the header is what stops a cut from erasing the gutter outright: it
+/// reports one space less padding than the bare `|` rows, so once every number
+/// in a block has been blanked it is the narrowest row left and one column
+/// survives. A row carrying a number that survived binds tighter still.
+fn span_header(lines: &[String], rows: &[Row], index: usize) -> Option<usize> {
+    if !matches!(rows[index], Row::Heading) {
+        return None;
+    }
+
+    let mut at = index + 1;
+    while matches!(rows.get(at), Some(Row::Other)) {
+        at += 1;
+    }
+
+    lines
+        .get(at)
+        .is_some_and(|line| line.trim_start().starts_with("--> "))
+        .then_some(at)
+}
+
+/// Remove `cut` spaces starting at `from`.
+///
+/// The caller has established they are spaces, so this is a plain splice: `cut`
+/// never exceeds the `allowed` the row reported -- or, for a `Continuation`, the
+/// padding of the `= note:` above it, which reported less.
+fn shrink(line: &mut String, from: usize, cut: usize) {
+    debug_assert!(
+        line.as_bytes()[from..from + cut].iter().all(|b| *b == b' '),
+        "cut {cut} at {from} is not padding in {line:?}"
+    );
+    line.replace_range(from..from + cut, "");
+}
+
+/// How one line of a rendered diagnostic relates to the gutter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Row {
+    /// A line that opens a diagnostic, which is `error`/`warning` anywhere and
+    /// `note:`/`help:` only where one rendered diagnostic gives way to the next.
+    Heading,
+    /// A row the gutter places: its padding starts at `from`, and `allowed` of
+    /// those spaces can go before the `|` column would reach the number.
+    Gutter { from: usize, allowed: usize },
+    /// A row inside the block that the gutter width does not place: a
+    /// sub-diagnostic's own `note:`/`help:` heading, which sits at column 0, and
+    /// a bare `...`, which rustc prints flush left at any width.
+    Fixed,
+    /// The second line of a `= note:` rustc split in two. It moves with the
+    /// gutter but never constrains the cut: it is indented past the `= note:` it
+    /// hangs off, and that note is a `Gutter` row in the same block already
+    /// reporting a smaller `allowed`.
+    Continuation,
+    /// The blank line rustc ends a rendered diagnostic with, which closes a
+    /// block cleanly.
+    Blank,
+    /// Anything else, including the rest of a multi-line `compile_error!`. A
+    /// block containing one below its span header is left alone; above the
+    /// header they are the tail of the message, and are skipped.
+    Other,
+}
+
+/// Classify every line, threading the state a `= note:` continuation needs.
+fn classify(lines: &[String]) -> Vec<Row> {
+    let mut rows = Vec::with_capacity(lines.len());
+    // Leading spaces of the `= note:` row a wrapped second line would belong to.
+    let mut wrapped: Option<usize> = None;
+    // Each rendered diagnostic cargo hands over ends in a blank line, so a blank
+    // is what separates a `note:` opening one of its own from a `note:`
+    // belonging to the error above it.
+    let mut starts_message = true;
+
+    for line in lines {
+        let row = row_of(line, wrapped, starts_message);
+        starts_message = matches!(row, Row::Blank);
+        wrapped = match row {
+            // A wrap can itself be wrapped, so the anchor outlives one row.
+            Row::Continuation => wrapped,
+            Row::Gutter { .. } if is_attached_note(line) => Some(indent(line)),
+            _ => None,
+        };
+        rows.push(row);
+    }
+
+    rows
+}
+
+/// Classify one line. `wrapped` is the indent of the `= note:` above it, if the
+/// line before this one could be the first half of a split note, and
+/// `starts_message` is whether this line opens one of the rendered diagnostics
+/// cargo handed over rather than continuing the one before it.
+fn row_of(line: &str, wrapped: Option<usize>, starts_message: bool) -> Row {
+    // Lines are trimmed of trailing whitespace before they get here.
+    if line.is_empty() {
+        return Row::Blank;
+    }
+
+    let before = indent(line);
+    let digits = line[before..]
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .count();
+    let after = line[before + digits..]
+        .bytes()
+        .take_while(|b| *b == b' ')
+        .count();
+    let rest = &line[before + digits + after..];
+    // One space always separates the number from what follows, so a numbered row
+    // reports its whole leading run and an unnumbered one keeps a single space.
+    let padding = before + after;
+
+    if padding > 0 && is_gutter(rest, digits) {
+        return Row::Gutter {
+            from: 0,
+            // Capped at `before` so the cut provably cannot reach the digits.
+            // rustc right-aligns a line number with exactly one space after it,
+            // which makes the cap a no-op on anything it emits -- but `allowed`
+            // is what `shrink` splices on, and it should not be one formatting
+            // change away from eating a digit in a release build.
+            allowed: (padding - 1).min(before),
+        };
+    }
+
+    // rustc prints the elision marker flush left and pads *after* it, so its
+    // padding starts past the dots rather than at column 0.
+    if let Some(pad) = line.strip_prefix("...") {
+        let spaces = pad.bytes().take_while(|b| *b == b' ').count();
+        return match spaces {
+            // A bare `...`, which has no padding to give.
+            0 if pad.is_empty() => Row::Fixed,
+            0 => Row::Other,
+            _ => Row::Gutter {
+                from: "...".len(),
+                allowed: spaces - 1,
+            },
+        };
+    }
+
+    if before == 0 {
+        if is_heading(line) {
+            return Row::Heading;
+        }
+        // rustc emits `note:` and `help:` as sub-diagnostics of the error above
+        // them, sharing its gutter, and cargo also emits them as whole
+        // diagnostics of their own: a post-monomorphization error arrives as an
+        // `error` followed by two free-standing `note`s, each sized to its own
+        // spans. Only the second kind opens a block. Reading a sub-diagnostic as
+        // one would split a diagnostic that shares a gutter into halves cut by
+        // different amounts, which is the one way this can misalign rather than
+        // merely under-cut.
+        if line.starts_with("note:") || line.starts_with("help:") {
+            return if starts_message {
+                Row::Heading
+            } else {
+                Row::Fixed
+            };
+        }
+        return Row::Other;
+    }
+
+    // Indented past the `= note:` above it: the second line rustc splits an
+    // `expected`/`found` pair onto.
+    match wrapped {
+        Some(anchor) if before > anchor => Row::Continuation,
+        _ => Row::Other,
+    }
+}
+
+/// Whether what follows a row's number and padding is a gutter marker.
+fn is_gutter(rest: &str, digits: usize) -> bool {
+    // A source line, and the bare rows rustc separates snippets with.
+    if rest == "|" || rest.starts_with("| ") {
+        return true;
+    }
+    // A suggestion rustc renders as a diff rather than an underline:
+    // `12 - let x: u8 = ...` beside `12 + let x: i64 = ...`.
+    if digits > 0 {
+        let marked = matches!(rest.as_bytes().first(), Some(b'-' | b'+' | b'~'));
+        if marked && (rest.len() == 1 || rest.as_bytes()[1] == b' ') {
+            return true;
+        }
+    }
+    // The rows that carry no number: a span header, a secondary span header, and
+    // an attached `= note:` or `= help:`.
+    digits == 0 && (rest.starts_with("--> ") || rest.starts_with("::: ") || rest.starts_with("= "))
+}
+
+/// Whether a line opens a diagnostic rather than continuing one.
+fn is_heading(line: &str) -> bool {
+    ["error", "warning"].iter().any(|level| {
+        line.strip_prefix(level)
+            .is_some_and(|rest| rest.starts_with([':', '[']))
+    })
+}
+
+/// Whether a line is the `= note:`/`= help:` a wrapped line would attach to.
+fn is_attached_note(line: &str) -> bool {
+    line.trim_start().starts_with("= ")
+}
+
+/// The number of leading spaces on a line.
+fn indent(line: &str) -> usize {
+    line.bytes().take_while(|b| *b == b' ').count()
 }
 
 /// Rewrite a toolchain source path to [`RUST`].
@@ -639,11 +921,13 @@ mod tests {
             n.normalize(rendered, "tests/ui/a.rs"),
             concat!(
                 "error[E0277]: the trait bound is not satisfied\n",
-                "   --> $CORE/src/lib.rs\n",
-                "    |\n",
-                "    | pub struct Event;\n",
-                "    | ^^^^^^^^^^^^^^^^\n",
-                "    = note: required by this bound\n",
+                // The gutter shrinks with the numbers: nothing in the golden is
+                // sized by where the dependency puts its code.
+                " --> $CORE/src/lib.rs\n",
+                "  |\n",
+                "  | pub struct Event;\n",
+                "  | ^^^^^^^^^^^^^^^^\n",
+                "  = note: required by this bound\n",
             )
         );
     }
@@ -708,6 +992,399 @@ mod tests {
                 "error[E0308]: mismatched types\n",
                 " --> tests/ui/a.rs:7:1\n",
                 "7 | let _x: u8 = \"s\";\n",
+            )
+        );
+    }
+
+    #[test]
+    fn a_dependencys_line_count_does_not_widen_the_fixtures_gutter() {
+        // rustc sizes the gutter to the widest line number anywhere in the
+        // diagnostic, so `508` in a dependency renders the *fixture's* own
+        // snippet three columns wide. Blanking the digits without reclaiming the
+        // width leaves the golden recording where the dependency puts its code,
+        // one indirection removed: moving `take` to line 1008 would re-bless
+        // every row here.
+        let n = with_deps(&[("/elsewhere/core", "core")]);
+        let rendered = concat!(
+            "error[E0277]: the trait bound `Widget: Sealed` is not satisfied\n",
+            "   --> src/bin/f_a.rs:2:15\n",
+            "    |\n",
+            "  2 |     dep::take(dep::Widget);\n",
+            "    |     --------- ^^^^^^^^^^^ the trait `Sealed` is not implemented\n",
+            "    |     |\n",
+            "    |     required by a bound introduced by this call\n",
+            "    |\n",
+            "note: required by a bound in `dep::take`\n",
+            "   --> /elsewhere/core/src/lib.rs:508:16\n",
+            "    |\n",
+            "508 | pub fn take<T: Sealed>(_t: T) {}\n",
+            "    |                ^^^^^^ required by this bound in `take`\n",
+        );
+        assert_eq!(
+            n.normalize(rendered, "tests/ui/a.rs"),
+            concat!(
+                "error[E0277]: the trait bound `Widget: Sealed` is not satisfied\n",
+                " --> tests/ui/a.rs:2:15\n",
+                "  |\n",
+                "2 |     dep::take(dep::Widget);\n",
+                "  |     --------- ^^^^^^^^^^^ the trait `Sealed` is not implemented\n",
+                "  |     |\n",
+                "  |     required by a bound introduced by this call\n",
+                "  |\n",
+                "note: required by a bound in `dep::take`\n",
+                " --> $CORE/src/lib.rs\n",
+                "  |\n",
+                "  | pub fn take<T: Sealed>(_t: T) {}\n",
+                "  |                ^^^^^^ required by this bound in `take`\n",
+            )
+        );
+    }
+
+    #[test]
+    fn a_suggestion_diff_moves_with_the_gutter() {
+        // The `-`/`+` rows rustc renders a rewrite as carry a line number but no
+        // `|`. Missing them would leave them behind while everything around them
+        // moved.
+        let n = with_deps(&[("/elsewhere/core", "core")]);
+        let rendered = concat!(
+            "error[E0308]: mismatched types\n",
+            "    --> src/bin/f_a.rs:2:19\n",
+            "     |\n",
+            "   2 |     let _x: i64 = 1u32;\n",
+            "     |             ---   ^^^^ expected `i64`, found `u32`\n",
+            "note: expected because of this\n",
+            "    --> /elsewhere/core/src/lib.rs:1205:11\n",
+            "     |\n",
+            "1205 | pub const N: i64 = 0;\n",
+            "     |           ^^^\n",
+            "help: change the type of the numeric literal from `u32` to `i64`\n",
+            "     |\n",
+            "   2 -     let _x: i64 = 1u32;\n",
+            "   2 +     let _x: i64 = 1i64;\n",
+            "     |\n",
+        );
+        assert_eq!(
+            n.normalize(rendered, "tests/ui/a.rs"),
+            concat!(
+                "error[E0308]: mismatched types\n",
+                " --> tests/ui/a.rs:2:19\n",
+                "  |\n",
+                "2 |     let _x: i64 = 1u32;\n",
+                "  |             ---   ^^^^ expected `i64`, found `u32`\n",
+                "note: expected because of this\n",
+                " --> $CORE/src/lib.rs\n",
+                "  |\n",
+                "  | pub const N: i64 = 0;\n",
+                "  |           ^^^\n",
+                "help: change the type of the numeric literal from `u32` to `i64`\n",
+                "  |\n",
+                "2 -     let _x: i64 = 1u32;\n",
+                "2 +     let _x: i64 = 1i64;\n",
+                "  |\n",
+            )
+        );
+    }
+
+    #[test]
+    fn a_wrapped_note_moves_with_the_gutter() {
+        // rustc splits a long `expected`/`found` pair over two lines and aligns
+        // the second under the first. It is placed by the gutter without being
+        // part of it, so it has to move and must not constrain the cut.
+        let n = with_deps(&[("/elsewhere/core", "core")]);
+        let rendered = concat!(
+            "error[E0308]: mismatched types\n",
+            "    --> src/bin/f_a.rs:6:10\n",
+            "     |\n",
+            "   6 |     want(v);\n",
+            "     |     ---- ^ expected `Alpha`, found `Beta`\n",
+            "     |\n",
+            "     = note: expected struct `Vec<HashMap<_, Alpha>>`\n",
+            "                found struct `Vec<HashMap<_, Beta>>`\n",
+            "note: function defined here\n",
+            "    --> /elsewhere/core/src/lib.rs:1205:8\n",
+            "     |\n",
+            "1205 | pub fn want(_v: Vec<HashMap<String, Alpha>>) {}\n",
+            "     |        ^^^^\n",
+        );
+        assert_eq!(
+            n.normalize(rendered, "tests/ui/a.rs"),
+            concat!(
+                "error[E0308]: mismatched types\n",
+                " --> tests/ui/a.rs:6:10\n",
+                "  |\n",
+                "6 |     want(v);\n",
+                "  |     ---- ^ expected `Alpha`, found `Beta`\n",
+                "  |\n",
+                "  = note: expected struct `Vec<HashMap<_, Alpha>>`\n",
+                "             found struct `Vec<HashMap<_, Beta>>`\n",
+                "note: function defined here\n",
+                " --> $CORE/src/lib.rs\n",
+                "  |\n",
+                "  | pub fn want(_v: Vec<HashMap<String, Alpha>>) {}\n",
+                "  |        ^^^^\n",
+            )
+        );
+    }
+
+    #[test]
+    fn the_elision_marker_keeps_its_place_when_the_gutter_shrinks() {
+        // rustc prints `...` flush left and pads *after* it, so its padding
+        // starts three columns in. Cutting from column 0 would eat the dots.
+        let n = with_deps(&[("/elsewhere/core", "core")]);
+        let rendered = concat!(
+            "error[E0308]: `match` arms have incompatible types\n",
+            "    --> src/bin/f_a.rs:5:14\n",
+            "     |\n",
+            "   2 |       let _x: u8 = match n {\n",
+            "     |  __________________-\n",
+            "   3 | |         0 => 0u8,\n",
+            "...    |\n",
+            "   5 | |         _ => \"s\",\n",
+            "     | |              ^^^ expected `u8`, found `&str`\n",
+            "note: required by a bound in `dep::pick`\n",
+            "    --> /elsewhere/core/src/lib.rs:1202:16\n",
+            "     |\n",
+            "1202 | pub fn pick<T: Copy>(_t: T) {}\n",
+            "     |                ^^^^\n",
+        );
+        assert_eq!(
+            n.normalize(rendered, "tests/ui/a.rs"),
+            concat!(
+                "error[E0308]: `match` arms have incompatible types\n",
+                " --> tests/ui/a.rs:5:14\n",
+                "  |\n",
+                "2 |       let _x: u8 = match n {\n",
+                "  |  __________________-\n",
+                "3 | |         0 => 0u8,\n",
+                "... |\n",
+                "5 | |         _ => \"s\",\n",
+                "  | |              ^^^ expected `u8`, found `&str`\n",
+                "note: required by a bound in `dep::pick`\n",
+                " --> $CORE/src/lib.rs\n",
+                "  |\n",
+                "  | pub fn pick<T: Copy>(_t: T) {}\n",
+                "  |                ^^^^\n",
+            )
+        );
+    }
+
+    #[test]
+    fn a_message_spanning_several_lines_still_re_aligns() {
+        // A `compile_error!` containing a newline puts the rest of its message
+        // between the heading and the span header, indented to the width of
+        // `error: ` rather than to the gutter -- so it stays where it is while
+        // everything the gutter does place moves.
+        let n = with_deps(&[("/elsewhere/core", "core")]);
+        let rendered = concat!(
+            "error: MYLIB-E001: expected a struct with named fields\n",
+            "       found a tuple struct\n",
+            "    --> src/bin/f_a.rs:6:9\n",
+            "     |\n",
+            "   6 |     derive_it!();\n",
+            "     |     ^^^^^^^^^^^^\n",
+            "note: in this expansion of `derive_it!`\n",
+            "    --> /elsewhere/core/src/lib.rs:1202:1\n",
+            "     |\n",
+            "1202 | macro_rules! derive_it {\n",
+            "     | ^^^^^^^^^^^^^^^^^^^^^^\n",
+        );
+        assert_eq!(
+            n.normalize(rendered, "tests/ui/a.rs"),
+            concat!(
+                "error: MYLIB-E001: expected a struct with named fields\n",
+                "       found a tuple struct\n",
+                " --> tests/ui/a.rs:6:9\n",
+                "  |\n",
+                "6 |     derive_it!();\n",
+                "  |     ^^^^^^^^^^^^\n",
+                "note: in this expansion of `derive_it!`\n",
+                " --> $CORE/src/lib.rs\n",
+                "  |\n",
+                "  | macro_rules! derive_it {\n",
+                "  | ^^^^^^^^^^^^^^^^^^^^^^\n",
+            )
+        );
+    }
+
+    #[test]
+    fn an_unrecognized_row_leaves_its_whole_diagnostic_alone() {
+        // The safety net. A row this does not understand could be placed by the
+        // gutter, and moving everything around it would misalign the block. Not
+        // reclaiming the width is the recoverable outcome; a mangled snippet is
+        // not.
+        let rendered = concat!(
+            "error[E0308]: mismatched types\n",
+            "    --> src/bin/f_a.rs:2:19\n",
+            "     |\n",
+            "   2 |     let _x: i64 = 1u32;\n",
+            "  something rustc has not printed before\n",
+            "     |             ^^^^\n",
+        );
+        assert_eq!(
+            normalizer().normalize(rendered, "tests/ui/a.rs"),
+            concat!(
+                "error[E0308]: mismatched types\n",
+                "    --> tests/ui/a.rs:2:19\n",
+                "     |\n",
+                "   2 |     let _x: i64 = 1u32;\n",
+                "  something rustc has not printed before\n",
+                "     |             ^^^^\n",
+            )
+        );
+    }
+
+    #[test]
+    fn a_diagnostic_without_a_snippet_has_no_gutter_to_re_align() {
+        assert_eq!(
+            normalizer().normalize("error: aborting due to 1 previous error\n", "tests/ui/a.rs"),
+            "error: aborting due to 1 previous error\n"
+        );
+    }
+
+    #[test]
+    fn a_gutter_the_fixtures_own_numbers_need_is_left_alone() {
+        // The fixture is what the golden is about, so its line numbers set the
+        // width and nothing is reclaimed. This is also what guards the
+        // sub-diagnostic rule: were that `note:` read as opening a block of its
+        // own, its half would shrink to one column while the half above it
+        // stayed at four.
+        let n = with_deps(&[("/elsewhere/core", "core")]);
+        let rendered = concat!(
+            "error[E0277]: the trait bound is not satisfied\n",
+            "    --> src/bin/f_a.rs:1202:15\n",
+            "     |\n",
+            "1202 |     take(Widget);\n",
+            "     |          ^^^^^^\n",
+            "note: required by a bound in `take`\n",
+            "    --> /elsewhere/core/src/lib.rs:8:16\n",
+            "     |\n",
+            "   8 | pub fn take<T: Sealed>(_t: T) {}\n",
+            "     |                ^^^^^^\n",
+        );
+        assert_eq!(
+            n.normalize(rendered, "tests/ui/a.rs"),
+            concat!(
+                "error[E0277]: the trait bound is not satisfied\n",
+                "    --> tests/ui/a.rs:1202:15\n",
+                "     |\n",
+                "1202 |     take(Widget);\n",
+                "     |          ^^^^^^\n",
+                "note: required by a bound in `take`\n",
+                "    --> $CORE/src/lib.rs\n",
+                "     |\n",
+                "     | pub fn take<T: Sealed>(_t: T) {}\n",
+                "     |                ^^^^^^\n",
+            )
+        );
+    }
+
+    #[test]
+    fn two_diagnostics_re_align_independently() {
+        let n = with_deps(&[("/elsewhere/core", "core")]);
+        let rendered = concat!(
+            "error[E0277]: first\n",
+            "   --> /elsewhere/core/src/lib.rs:508:1\n",
+            "    |\n",
+            "508 | pub struct Event;\n",
+            "    | ^^^^^^^^^^^^^^^^\n",
+            "\n",
+            "error[E0308]: second\n",
+            " --> src/bin/f_a.rs:4:17\n",
+            "  |\n",
+            "4 |     let _x: u8 = \"s\";\n",
+            "  |                  ^^^\n",
+        );
+        assert_eq!(
+            n.normalize(rendered, "tests/ui/a.rs"),
+            concat!(
+                "error[E0277]: first\n",
+                " --> $CORE/src/lib.rs\n",
+                "  |\n",
+                "  | pub struct Event;\n",
+                "  | ^^^^^^^^^^^^^^^^\n",
+                "\n",
+                "error[E0308]: second\n",
+                " --> tests/ui/a.rs:4:17\n",
+                "  |\n",
+                "4 |     let _x: u8 = \"s\";\n",
+                "  |                  ^^^\n",
+            )
+        );
+    }
+
+    #[test]
+    fn a_row_padded_unlike_rustc_cannot_have_its_digits_eaten() {
+        // rustc right-aligns a line number with exactly one space after it, so
+        // this shape does not come out of the compiler today. It is here because
+        // the alternative failure is the worst one available: without the cap on
+        // `allowed`, the cut reaches into the digits, and in a release build --
+        // where the `debug_assert` is gone -- that silently rewrites the number
+        // and is not even idempotent, so re-blessing eats another digit.
+        let rendered = concat!(
+            "error[E0308]: mismatched types\n",
+            "    --> src/bin/f_a.rs:2:1\n",
+            "     |\n",
+            "   2 |     x\n",
+            "12345  | src\n",
+            "     |\n",
+        );
+        let once = normalizer().normalize(rendered, "tests/ui/a.rs");
+        assert!(once.contains("12345"), "a line number lost digits: {once}");
+        assert_eq!(
+            once,
+            normalizer().normalize(&once, "tests/ui/a.rs"),
+            "normalizing twice must not differ from normalizing once"
+        );
+    }
+
+    #[test]
+    fn a_free_standing_note_re_aligns_on_its_own() {
+        // A post-monomorphization error arrives from cargo as three separate
+        // rendered diagnostics, two of them at level `note`, each sized to its
+        // own spans. Read as sub-diagnostics of the error they would keep the
+        // dependency's width with every digit blanked, which is the leak this
+        // exists to close.
+        let n = with_deps(&[("/elsewhere/core", "core")]);
+        let rendered = concat!(
+            "error[E0080]: evaluation panicked: N must be a power of two\n",
+            "    --> /elsewhere/core/src/lib.rs:1219:13\n",
+            "     |\n",
+            "1219 |     const { assert!(N.is_power_of_two(), \"..\") };\n",
+            "     |             ^^^^^^ evaluation of `split::<3>` failed here\n",
+            "\n",
+            "note: erroneous constant encountered\n",
+            "    --> /elsewhere/core/src/lib.rs:1219:5\n",
+            "     |\n",
+            "1219 |     const { assert!(N.is_power_of_two(), \"..\") };\n",
+            "     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n",
+            "\n",
+            "note: the above error was encountered while instantiating `fn split::<3>`\n",
+            " --> src/bin/f_a.rs:4:13\n",
+            "  |\n",
+            "4 | fn main() { split::<3>(); }\n",
+            "  |             ^^^^^^^^^^^^\n",
+        );
+        assert_eq!(
+            n.normalize(rendered, "tests/ui/a.rs"),
+            concat!(
+                "error[E0080]: evaluation panicked: N must be a power of two\n",
+                " --> $CORE/src/lib.rs\n",
+                "  |\n",
+                "  |     const { assert!(N.is_power_of_two(), \"..\") };\n",
+                "  |             ^^^^^^ evaluation of `split::<3>` failed here\n",
+                "\n",
+                "note: erroneous constant encountered\n",
+                " --> $CORE/src/lib.rs\n",
+                "  |\n",
+                "  |     const { assert!(N.is_power_of_two(), \"..\") };\n",
+                "  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n",
+                "\n",
+                // Already as narrow as its own spans need.
+                "note: the above error was encountered while instantiating `fn split::<3>`\n",
+                " --> tests/ui/a.rs:4:13\n",
+                "  |\n",
+                "4 | fn main() { split::<3>(); }\n",
+                "  |             ^^^^^^^^^^^^\n",
             )
         );
     }

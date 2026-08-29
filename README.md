@@ -83,7 +83,7 @@ help: provide the argument
   |                ++++++++++
 ```
 
-What it drops is entirely rustc-rendering detail — source snippets, underline art, and the `= note:` lines that a rustc release reflows. What it keeps is every error code, every primary message and every span, so it still catches every regression that matters: a fixture that stops failing, or one that starts failing for a _different_ reason. On this crate's own UI suite it takes 33 golden lines down to 7; the single diagnostic above goes from 15 lines to 3. Re-bless your own suite both ways to see the ratio you would get.
+What it drops is entirely rustc-rendering detail — source snippets, underline art, and the `= note:` lines that a rustc release reflows. What it keeps is every error code, every primary message and every span, so it still catches every regression that matters: a fixture that stops failing, or one that starts failing for a _different_ reason. A message printed over more than one line is kept whole: a `compile_error!` containing a `\n` is split where its author split it, not where a rustc release chose to, so it is part of the assertion. On this crate's own UI suite it takes 33 golden lines down to 7; the single diagnostic above goes from 15 lines to 3. Re-bless your own suite both ways to see the ratio you would get.
 
 The filter is applied to both sides of the comparison, so an existing `Exact` golden passes in `Brief` mode unchanged. Switching is a one-line change; blessing afterwards shrinks the goldens to match.
 
@@ -167,7 +167,7 @@ And be honest about the size of the win: `trybuild` is a dev-dependency. It neve
 | Running the compiled program and checking its output | That is [`trycmd`](https://docs.rs/trycmd)/[`assert_cmd`](https://docs.rs/assert_cmd) territory and a different problem. |
 | Glob patterns | A directory or an explicit file covers every real use and costs no matcher. This is why `trybuild` needs `glob`. |
 | Inferring dependencies from the host manifest | The single biggest simplification, and also better behaviour — see below. |
-| Cross-compilation, custom targets, `-Z` flags, nightly-only features | A compile-fail suite runs on the host toolchain. If you need more, you need `trybuild`. |
+| `-Z` flags, nightly-only features | A compile-fail suite runs on the toolchain you invoke it with. If you need more, you need `trybuild`. |
 | Windows | Not in v1. Path normalization and the `\r\n` question need someone with a Windows machine to get right, and claiming support without testing it is worse than not claiming it. Note the separator mismatch is not merely cosmetic: the rule below that keeps line numbers only for the fixture's own spans would fail to recognise `src\main.rs` as the fixture and strip them from every span. The normalization is kept in one module so it is a contained addition later. |
 
 The moment a suite grows past what the host toolchain can express, `trybuild` is the answer and this crate would rather say so than grow toward it.
@@ -182,6 +182,10 @@ All fixtures build in one invocation, in parallel. Measured here on 10 cores, 20
 | One invocation, all fixtures | **0.18 s** |
 
 The gap is mostly parallelism rather than process startup, which is only about 20 ms an invocation: a fixture-at-a-time loop leaves every core but one idle. The win therefore grows with both fixture count and core count.
+
+### Disk
+
+Building rather than checking ([why](#build-not-check)) costs scratch space: codegen and linking leave a linked binary per fixture where a check leaves none. Debug info and incremental compilation are both turned off for the fixture build — neither is observable in a diagnostic, and together they were 59% of the scratch directory on this crate's own suite (23 MB down to 9.5 MB). What remains scales with fixture count, so budget for it on a large suite.
 
 ## Declared dependencies, not inferred ones
 
@@ -204,6 +208,8 @@ t.edition("2021");
 - Fixtures build with `--offline`, so a dependency must be a path dependency or already in the local cargo cache. A compile-fail suite that can reach the network is a suite that fails in CI for unrelated reasons.
 - Warnings in the fixture itself land in its golden. Warnings from a *path dependency* do not: diagnostics are attributed by target, so a dependency's own warnings stay with the dependency instead of being replayed into every fixture's golden the way `trybuild` does.
 - `RUSTFLAGS` is cleared for the fixture build, including `[build] rustflags` from any `.cargo/config.toml`. An inherited `-D warnings` would turn every fixture's warning into an error and silently change what the goldens contain.
+- Fixtures are built for whatever target the suite itself was built for. `CARGO_BUILD_TARGET`, and a `[build] target` in `.cargo/config.toml`, are deliberately **not** cleared: a `no_std` crate's compile-fail invariants are usually about its target, and a const guard asserting a 64-bit pointer can only be tested by building for a target that has one. `trybuild` follows the same triple, by passing `--target` for the one it was itself compiled for. The consequence is that goldens are target-specific, the same way they are toolchain-specific — bless them on the target your CI uses, or use `Brief`.
+- Every `CARGO_PROFILE_*` variable is cleared too, for the same reason one door along: an inherited `CARGO_PROFILE_DEV_DEBUG_ASSERTIONS=false` turns a `#[cfg(debug_assertions)] compile_error!` fixture green, and `CARGO_PROFILE_DEV_OPT_LEVEL` changes which post-monomorphization errors fire at all. A shell variable differs between two people on the same commit; the goldens must not. A `[profile.dev]` in a committed `.cargo/config.toml` is left to apply — it is the same for everyone who checks the repo out, and it is how the crate under test is built anyway.
 - **Cargo** suppresses any diagnostic whose message begins with `aborting due to`, or ends with `warning emitted` or `warnings emitted`, before any harness can see it -- that is how it strips rustc's own summary lines, and a `compile_error!` worded any of those ways is stripped with them. If it is the fixture's only error, the harness reports that rather than blessing an empty golden. If the fixture has other errors too, they are blessed and the suppressed one is silently absent, which nothing downstream of cargo can detect. Word the message differently.
 
 ## Concurrency
@@ -213,6 +219,24 @@ Every fixture in a run is written into the same scratch project, so a run holds 
 ## How it works
 
 Every fixture becomes a `[[bin]]` target of one generated scratch project, and a single `cargo build --bins --keep-going` compiles them all. Because the fixtures are independent crates, cargo compiles them **in parallel**, which a fixture-at-a-time loop cannot do at all.
+
+### Build, not check
+
+The scratch project is compiled with `cargo build`, not `cargo check`. `check` stops after analysis, and a whole class of compile-time guard only fires during codegen — a `const { assert!(...) }` inside a generic function is evaluated once per monomorphization, so nothing evaluates it until something instantiates it:
+
+```rust
+pub fn split<const N: usize>() {
+    const { assert!(N.is_power_of_two(), "N must be a power of two") };
+}
+
+fn main() {
+    split::<3>();          // the guard fires here, and only when codegen reaches it
+}
+```
+
+`cargo check` compiles that file without a word. `cargo build` fails it with `error[E0080]: evaluation panicked: N must be a power of two` — the guard's own message, which is exactly what the golden should record. `trybuild` runs `cargo check` unless the suite also contains a `pass` fixture, so a check-only compile-fail suite passes a fixture like this silently, asserting nothing.
+
+`tests/ui/const_guard_fires_at_monomorphization.rs` is that case, kept in this crate's own suite so the choice cannot be undone by accident. The cost is disk, above.
 
 Parallel compilation interleaves diagnostics, so the output has to say which target each one came from. `--message-format=json` does; plain stderr does not. So `nocompile` reads cargo's JSON and files each `rendered` diagnostic under its `target.name`. `rendered` is byte-for-byte what plain stderr would have printed — cargo renders it and the JSON carries the same string — so the goldens are unchanged by this.
 
@@ -258,6 +282,8 @@ note: required by a bound in `take`
 ```
 
 Those numbers record where a dependency happens to put its code today. Without this, adding a doc comment near the top of a dependency file re-blesses every golden whose diagnostic reaches into it, for a reason that has nothing to do with any invariant under test. `trybuild` does the same thing, for the same reason.
+
+The gutter shrinks with them. rustc sizes it to the widest line number *anywhere* in a diagnostic, children included, so an item at line 508 in a dependency renders the **fixture's own** snippet three columns wide. Blanking the digits alone would leave that width behind, and the dependency's line count would be back in the golden through the side door — moving that item to line 1008 would re-bless every row, including the ones describing the fixture. So the gutter is re-aligned to the widest number that survived. `trybuild` writes the same shape, so a migrating golden still matches.
 
 ## Migrating from trybuild
 
