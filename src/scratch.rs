@@ -21,11 +21,8 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 /// The package name of the generated project. It appears only in cargo's own
-/// summary lines, which the classifier drops.
+/// own error lines, which carry no fixture attribution and so reach no golden.
 pub(crate) const CRATE_NAME: &str = "nocompile-scratch";
-
-/// The bin target's name.
-pub(crate) const BIN_NAME: &str = "fixture";
 
 /// A path dependency the caller declared.
 #[derive(Debug, Clone)]
@@ -62,8 +59,13 @@ impl Layout {
         self.project.join("Cargo.toml")
     }
 
-    pub(crate) fn main_rs(&self) -> PathBuf {
-        self.project.join("src").join("main.rs")
+    /// Where fixture sources are written, one bin target each.
+    pub(crate) fn bin_dir(&self) -> PathBuf {
+        self.project.join("src").join("bin")
+    }
+
+    pub(crate) fn bin_path(&self, bin: &str) -> PathBuf {
+        self.bin_dir().join(format!("{bin}.rs"))
     }
 }
 
@@ -110,6 +112,44 @@ fn sanitize(name: &str) -> String {
         .collect()
 }
 
+/// A bin target name for each fixture, in the order given.
+///
+/// Derived from the fixture's own path rather than its position, so inserting a
+/// fixture does not rename every bin after it and force a full rebuild. Cargo
+/// requires the names be unique, and two different paths can sanitize to the
+/// same text, so repeats get a numeric suffix.
+pub(crate) fn bin_names(relatives: &[String]) -> Vec<String> {
+    let mut names: Vec<String> = Vec::with_capacity(relatives.len());
+    for relative in relatives {
+        // Leading `f_` because a bin name has to start with something that is
+        // not a digit, and a fixture path is free to.
+        let base = format!("f_{}", sanitize_bin(relative));
+        let mut candidate = base.clone();
+        let mut n = 2;
+        while names.contains(&candidate) {
+            candidate = format!("{base}_{n}");
+            n += 1;
+        }
+        names.push(candidate);
+    }
+    names
+}
+
+/// Reduce a fixture path to the characters a bin name and a file name share.
+fn sanitize_bin(relative: &str) -> String {
+    let trimmed = relative.strip_suffix(".rs").unwrap_or(relative);
+    trimmed
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// Generate the scratch project's manifest.
 ///
 /// The manifest is *written*, not read. That is the single biggest
@@ -117,7 +157,12 @@ fn sanitize(name: &str) -> String {
 /// and it is also better behaviour: inferring the host's dev-dependencies
 /// silently gives a fixture access to crates the invariant under test never
 /// mentions, so a fixture can pass for a reason nobody intended.
-pub(crate) fn manifest(edition: &str, deps: &[Dependency], raw: &[String]) -> String {
+pub(crate) fn manifest(
+    edition: &str,
+    deps: &[Dependency],
+    raw: &[String],
+    bins: &[String],
+) -> String {
     let mut out = String::new();
 
     // Hazard 2. Load-bearing; never remove.
@@ -128,7 +173,11 @@ pub(crate) fn manifest(edition: &str, deps: &[Dependency], raw: &[String]) -> St
     out.push_str(&format!("name = \"{CRATE_NAME}\"\n"));
     out.push_str("version = \"0.0.0\"\n");
     out.push_str(&format!("edition = {}\n", toml_string(edition)));
-    out.push_str("publish = false\n\n");
+    out.push_str("publish = false\n");
+    // Every bin is declared explicitly, so a fixture left in `src/bin` by an
+    // earlier run with more fixtures is not silently compiled as part of this
+    // one. Auto-discovery would do exactly that.
+    out.push_str("autobins = false\n\n");
 
     out.push_str("[dependencies]\n");
     for dep in deps {
@@ -140,9 +189,16 @@ pub(crate) fn manifest(edition: &str, deps: &[Dependency], raw: &[String]) -> St
     }
     out.push('\n');
 
-    out.push_str("[[bin]]\n");
-    out.push_str(&format!("name = {}\n", toml_string(BIN_NAME)));
-    out.push_str("path = \"src/main.rs\"\n");
+    // One bin per fixture, so a single cargo invocation compiles them all and
+    // every diagnostic arrives tagged with the target it came from.
+    for bin in bins {
+        out.push_str("\n[[bin]]\n");
+        out.push_str(&format!("name = {}\n", toml_string(bin)));
+        out.push_str(&format!(
+            "path = {}\n",
+            toml_string(&format!("src/bin/{bin}.rs"))
+        ));
+    }
 
     for lines in raw {
         out.push('\n');
@@ -192,16 +248,49 @@ mod tests {
 
     #[test]
     fn the_empty_workspace_table_is_present() {
-        let m = manifest("2021", &[], &[]);
+        let m = manifest("2021", &[], &[], &[]);
         assert!(m.contains("\n[workspace]\n"), "{m}");
     }
 
     #[test]
-    fn declares_the_bin_target() {
-        let m = manifest("2021", &[], &[]);
+    fn declares_one_bin_target_per_fixture() {
+        let m = manifest("2021", &[], &[], &["f_a".into(), "f_b".into()]);
         assert!(
-            m.contains("[[bin]]\nname = \"fixture\"\npath = \"src/main.rs\"\n"),
+            m.contains("[[bin]]\nname = \"f_a\"\npath = \"src/bin/f_a.rs\"\n"),
             "{m}"
+        );
+        assert!(
+            m.contains("[[bin]]\nname = \"f_b\"\npath = \"src/bin/f_b.rs\"\n"),
+            "{m}"
+        );
+    }
+
+    #[test]
+    fn disables_bin_auto_discovery() {
+        // Or a fixture left behind by a longer earlier run would be compiled as
+        // part of this one.
+        let m = manifest("2021", &[], &[], &[]);
+        assert!(m.contains("autobins = false\n"), "{m}");
+    }
+
+    #[test]
+    fn bin_names_come_from_the_fixture_path() {
+        assert_eq!(
+            bin_names(&["tests/ui/a.rs".into(), "tests/ui/b-c.rs".into()]),
+            vec!["f_tests_ui_a".to_string(), "f_tests_ui_b_c".to_string()]
+        );
+    }
+
+    #[test]
+    fn bin_names_are_unique_even_when_paths_sanitize_alike() {
+        // `a/b.rs` and `a_b.rs` both reduce to the same text.
+        assert_eq!(
+            bin_names(&["a/b.rs".into(), "a_b.rs".into(), "a-b.rs".into()]),
+            vec![
+                "f_a_b".to_string(),
+                "f_a_b_2".to_string(),
+                "f_a_b_3".to_string()
+            ]
         );
     }
 
@@ -214,6 +303,7 @@ mod tests {
                 path: "/w/my-crate".into(),
             }],
             &[],
+            &[],
         );
         assert!(m.contains("my-crate = { path = \"/w/my-crate\" }\n"), "{m}");
         assert!(m.contains("edition = \"2024\"\n"), "{m}");
@@ -221,7 +311,7 @@ mod tests {
 
     #[test]
     fn appends_raw_manifest_lines() {
-        let m = manifest("2021", &[], &["[features]\nfoo = []".to_string()]);
+        let m = manifest("2021", &[], &["[features]\nfoo = []".to_string()], &[]);
         assert!(m.ends_with("\n[features]\nfoo = []\n"), "{m}");
     }
 
@@ -233,6 +323,7 @@ mod tests {
                 name: "c".into(),
                 path: "/a\"b\\c".into(),
             }],
+            &[],
             &[],
         );
         assert!(m.contains(r#"c = { path = "/a\"b\\c" }"#), "{m}");

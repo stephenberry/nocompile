@@ -22,7 +22,8 @@
 //! }
 //! ```
 //!
-//! Each fixture is compiled on its own. A `compile_fail` fixture must fail, and
+//! Every fixture becomes a bin target of one generated project and they all
+//! compile in a single, parallel `cargo build`. A `compile_fail` fixture must fail, and
 //! its diagnostics must match the `.stderr` golden beside it. Run the suite with
 //! `NOCOMPILE=overwrite` to write the goldens, then **read what they captured** --
 //! a missing golden is a failure rather than an implicit bless precisely so that
@@ -41,8 +42,8 @@
 //! `Brief` compares only error codes, primary messages and span headers, and
 //! drops the source snippets, underline art and `= note:` lines that a rustc
 //! release reflows. It still catches every regression that matters: a fixture
-//! that stops failing, or starts failing for a different reason. On one real
-//! 19-fixture suite it takes 436 golden lines down to 78.
+//! that stops failing, or starts failing for a different reason. On this crate's
+//! own UI suite it takes 33 golden lines down to 7.
 //!
 //! # Zero dependencies, dev-dependencies included
 //!
@@ -98,10 +99,10 @@
 #![warn(missing_docs, missing_debug_implementations)]
 
 mod cases;
-mod classify;
 mod compare;
 mod compile;
 mod diff;
+mod json;
 mod normalize;
 mod outcome;
 mod scratch;

@@ -69,16 +69,6 @@ pub enum Failure {
         /// The comparison mode in force.
         mode: Mode,
     },
-    /// A line at column 0 that starts no recognized diagnostic block. Reported
-    /// loudly rather than guessed at: the failure mode of a silent filter is
-    /// garbage creeping into goldens, and this is the first thing to look at
-    /// when a new cargo release changes its output.
-    Unclassified {
-        /// The offending line.
-        line: String,
-        /// The full stderr it came from.
-        stderr: String,
-    },
     /// A fixture directory that matched no `.rs` files. Reported rather than
     /// passed silently: an empty directory means the suite is not running.
     NoFixtures {
@@ -144,12 +134,6 @@ impl Display for Failure {
                     "\n\n{diff}\nrun with NOCOMPILE=overwrite to update the golden"
                 )
             }
-            Failure::Unclassified { line, stderr } => write!(
-                f,
-                "nocompile does not understand this output line:\n\n    {line}\n\n\
-                 It is at column 0 and starts no recognized diagnostic block, so the harness \
-                 cannot tell whether it belongs in the golden. Full stderr:\n\n{stderr}"
-            ),
             Failure::NoFixtures { directory } => write!(
                 f,
                 "no .rs fixtures in {} -- the suite would pass without testing anything",

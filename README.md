@@ -174,9 +174,14 @@ The moment a suite grows past what the host toolchain can express, `trybuild` is
 
 ### Speed
 
-One fixture is one `cargo build`, so cargo's startup and fingerprint scan are paid once per fixture. `trybuild` builds all fixtures in a single invocation and demultiplexes the diagnostics back to each one — which it can do because it is already parsing `--message-format=json`, where every diagnostic carries the file it belongs to. Plain stderr has no such delimiter, so batching here would mean guessing which fixture each interleaved block came from. That is the direct cost of the zero-dependency design, not an oversight, and it will not be fixed without taking the JSON dependency back.
+All fixtures build in one invocation, in parallel. Measured here on 10 cores, 20 fixtures warm:
 
-Measured on this crate's own suite, that is under 100 ms per fixture against a warm cache, and it scales linearly. Fine for a suite of tens; worth knowing before pointing it at a suite of hundreds, where batching would start to matter more than the dependency count does.
+| | |
+|---|---|
+| One `cargo build` per fixture | 1.25 s |
+| One invocation, all fixtures | **0.18 s** |
+
+The gap is mostly parallelism rather than process startup, which is only about 20 ms an invocation: a fixture-at-a-time loop leaves every core but one idle. The win therefore grows with both fixture count and core count.
 
 ## Declared dependencies, not inferred ones
 
@@ -197,7 +202,7 @@ t.edition("2021");
 
 - A fixture is built as a bin and compiled **verbatim**, so it must define `fn main`, as `trybuild` fixtures do. The harness does not add one: detecting a real `fn main` needs a parser, and a wrong guess writes harness-injected source into the golden under the fixture's own name. A fixture without one gets a plain `E0601`, which says what to do about it.
 - Fixtures build with `--offline`, so a dependency must be a path dependency or already in the local cargo cache. A compile-fail suite that can reach the network is a suite that fails in CI for unrelated reasons.
-- Warnings from the crate under test land in the fixture's stderr and so in its golden, exactly as they do with `trybuild`. Keep the crate under test warning-clean, or use `Mode::Brief`.
+- Warnings in the fixture itself land in its golden. Warnings from a *path dependency* do not: diagnostics are attributed by target, so a dependency's own warnings stay with the dependency instead of being replayed into every fixture's golden the way `trybuild` does.
 - `RUSTFLAGS` is cleared for the fixture build, including `[build] rustflags` from any `.cargo/config.toml`. An inherited `-D warnings` would turn every fixture's warning into an error and silently change what the goldens contain.
 - A diagnostic message beginning with `aborting due to` is suppressed by **cargo itself** before any harness can see it, because that is where cargo filters rustc's own abort line. If a `compile_error!` in your crate is worded that way it will never reach a golden; word it differently.
 
@@ -207,9 +212,17 @@ Every fixture in a run is written to the same scratch `src/main.rs`, so a run ho
 
 ## How it works
 
-`trybuild` runs `cargo build --message-format=json` and reads each diagnostic's pre-rendered `rendered` field, which is why it needs a JSON stack. But `rendered` is byte-for-byte what plain stderr prints — cargo renders it and the JSON just carries the same string. So `nocompile` reads plain stderr with `--quiet`, which is already almost exactly the golden.
+Every fixture becomes a `[[bin]]` target of one generated scratch project, and a single `cargo build --bins --keep-going` compiles them all. Because the fixtures are independent crates, cargo compiles them **in parallel**, which a fixture-at-a-time loop cannot do at all.
 
-What remains is cargo's and rustc's own summary lines, which name the scratch crate and count the errors. Those are **classified** out rather than filtered out: every line at column 0 is matched against a known shape, and one that matches nothing is a hard error naming the line. The failure mode of a silent filter is garbage creeping into goldens; the failure mode of this is a loud, actionable message the first time cargo changes its output.
+Parallel compilation interleaves diagnostics, so the output has to say which target each one came from. `--message-format=json` does; plain stderr does not. So `nocompile` reads cargo's JSON and files each `rendered` diagnostic under its `target.name`. `rendered` is byte-for-byte what plain stderr would have printed — cargo renders it and the JSON carries the same string — so the goldens are unchanged by this.
+
+That is why the crate contains a JSON parser (`src/json.rs`, std only, no dependency). It earns its place three times over:
+
+- **Attribution is exact rather than inferred.** No guessing which fixture an interleaved block belongs to.
+- **Cargo's own status and summary lines never enter the stream.** They are not `compiler-message` records, so there is nothing to filter and no classifier to keep correct as cargo's wording drifts.
+- **A pass fixture is proved by a `compiler-artifact`,** not by absence of errors. A target cargo never got to also has no errors.
+
+A cargo-level failure — an unparseable manifest, an unresolvable dependency — emits no JSON at all, so it is recognized by the absence of `build-finished` and reported once against the run rather than blamed on every fixture.
 
 Normalization is a short, fixed list of substitutions and is meant to stay that way — every substitution is something a golden can no longer distinguish:
 

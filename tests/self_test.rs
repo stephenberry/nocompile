@@ -612,23 +612,35 @@ fn assert_panics_with_the_report() {
 /// Cargo failing on its own terms is not a property of the fixture, and must not
 /// be mistaken for one. A golden blessed from an unresolvable manifest would
 /// record the harness's misconfiguration rather than the invariant under test.
+///
+/// It is reported once, against the run, rather than once per fixture: one
+/// unparseable manifest is not evidence about any particular fixture, and
+/// blaming all of them would bury the single line that says what to fix.
 #[test]
 fn a_cargo_failure_is_not_reported_as_a_diagnostic() {
     let sandbox = Sandbox::new("cargo-failure");
     sandbox.write("ui/rejected.rs", REJECTED);
+    sandbox.write("ui/other.rs", REJECTED);
 
     let mut t = sandbox.cases();
     t.compile_fail("ui/rejected.rs");
+    t.compile_fail("ui/other.rs");
     t.raw_manifest_lines("this is not valid toml [[[");
 
     let outcome = t.overwrite(true).run();
-    let failure = sole_failure(&outcome);
-    let Failure::Cargo { message } = failure else {
-        panic!("expected Cargo, got {failure:?}");
+    assert!(!outcome.is_success());
+    assert_eq!(
+        outcome.setup_failures().len(),
+        1,
+        "one manifest error should be reported once:\n{}",
+        outcome.report()
+    );
+    let Failure::Cargo { message } = &outcome.setup_failures()[0] else {
+        panic!("expected Cargo, got {:?}", outcome.setup_failures()[0]);
     };
     assert!(message.contains("expected `=`"), "{message}");
     assert!(
-        !sandbox.path("ui/rejected.stderr").exists(),
+        !sandbox.path("ui/rejected.stderr").exists() && !sandbox.path("ui/other.stderr").exists(),
         "bless wrote a golden from a manifest cargo could not parse"
     );
 }
@@ -735,4 +747,44 @@ fn a_diagnostic_reaching_into_the_standard_library_is_portable() {
             "the home directory reached the golden:\n{golden}"
         );
     }
+}
+
+/// A warning in a path dependency belongs to that dependency's build, not to any
+/// fixture's golden.
+///
+/// Under a fixture-at-a-time design cargo replays a cached dependency warning on
+/// every rebuild, so the same warning lands in every golden and the suite churns
+/// whenever the dependency does. Attribution by target removes the problem
+/// rather than documenting it.
+#[test]
+fn a_dependency_warning_does_not_reach_a_fixtures_golden() {
+    let sandbox = Sandbox::new("dependency-warning");
+    sandbox.write(
+        "helper/Cargo.toml",
+        "[package]\nname = \"helper\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[dependencies]\n",
+    );
+    // `unused_variables` fires here, in the dependency.
+    sandbox.write(
+        "helper/src/lib.rs",
+        "pub fn small() -> u8 {\n    let unused = 1;\n    0\n}\n",
+    );
+    sandbox.write(
+        "ui/misuses_helper.rs",
+        "fn main() {\n    let _x: String = helper::small();\n}\n",
+    );
+
+    let mut t = sandbox.cases();
+    t.dependency_path("helper", "helper");
+    t.compile_fail("ui/misuses_helper.rs");
+    assert_passed(&t.overwrite(true).run());
+
+    let golden = sandbox.read("ui/misuses_helper.stderr");
+    assert!(
+        golden.contains("error[E0308]: mismatched types"),
+        "{golden}"
+    );
+    assert!(
+        !golden.contains("unused"),
+        "a dependency's warning reached the fixture's golden:\n{golden}"
+    );
 }

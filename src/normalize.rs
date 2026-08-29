@@ -41,8 +41,11 @@ pub(crate) const RUST: &str = "$RUST";
 /// The path rewrites for one run. Built once and reused for every fixture; only
 /// [`Normalizer::normalize`]'s `fixture` argument changes between them.
 pub(crate) struct Normalizer {
-    /// Absolute path of the scratch project's `src/main.rs`.
+    /// Absolute path of the scratch source file this fixture was written to.
     scratch_main: String,
+    /// The same file as cargo names it: relative to the scratch package root,
+    /// which is the form it takes in a span header for the crate being compiled.
+    scratch_relative: String,
     /// Absolute path of the scratch root, covering both the generated project
     /// and its private target directory.
     scratch_root: String,
@@ -59,6 +62,7 @@ impl Normalizer {
     pub(crate) fn new(
         scratch_root: &Path,
         scratch_main: &Path,
+        scratch_relative: &str,
         manifest_dir: &Path,
         dependencies: &[Dependency],
     ) -> Self {
@@ -73,6 +77,7 @@ impl Normalizer {
 
         Self {
             scratch_main: scratch_main.display().to_string(),
+            scratch_relative: scratch_relative.to_string(),
             scratch_root: scratch_root.display().to_string(),
             manifest_dir: manifest_dir.display().to_string(),
             cargo_home: cargo_home().map(|home| home.display().to_string()),
@@ -83,8 +88,8 @@ impl Normalizer {
     /// Rewrite `text` so it says the same thing on any machine.
     ///
     /// `fixture` is the fixture's path relative to the host manifest directory:
-    /// the scratch project's `src/main.rs` is rewritten to it, which is what
-    /// makes a golden readable and what lets `trybuild` goldens migrate.
+    /// the scratch project's copy of the fixture is rewritten to it, which is
+    /// what makes a golden readable and what lets `trybuild` goldens migrate.
     pub(crate) fn normalize(&self, text: &str, fixture: &str) -> String {
         let mut lines: Vec<String> = Vec::new();
         // Whether the rows still arriving belong to the snippet under a span
@@ -137,13 +142,12 @@ impl Normalizer {
         let line = replace_dir(line, &self.scratch_main, fixture);
         let line = replace_dir(&line, &self.scratch_root, SCRATCH);
         // Cargo reports paths in the package under compilation relative to
-        // that package's root, so the scratch main appears bare as
-        // `src/main.rs`. Anchored to a span header rather than replaced
-        // globally: a fixture is free to contain the literal text
-        // `src/main.rs`, and a path dependency is free to have a file of
-        // that name, and rewriting either to the fixture path would put a
-        // lie in the golden.
-        let line = rewrite_span_target(&line, "src/main.rs", fixture);
+        // that package's root, so the fixture's own file appears bare as
+        // `src/bin/<name>.rs`. Anchored to a span header rather than replaced
+        // globally: a fixture is free to contain that literal text, and a path
+        // dependency is free to have a file of that name, and rewriting either
+        // to the fixture path would put a lie in the golden.
+        let line = rewrite_span_target(&line, &self.scratch_relative, fixture);
 
         // Before `CARGO_HOME`, which is a sibling of the toolchain directory
         // rather than a parent of it, so the two never compete -- but the
@@ -436,7 +440,8 @@ mod tests {
 
     fn normalizer() -> Normalizer {
         Normalizer {
-            scratch_main: "/w/target/nocompile/host/project/src/main.rs".into(),
+            scratch_main: "/w/target/nocompile/host/project/src/bin/f_a.rs".into(),
+            scratch_relative: "src/bin/f_a.rs".into(),
             scratch_root: "/w/target/nocompile/host".into(),
             manifest_dir: "/w".into(),
             cargo_home: Some("/home/u/.cargo".into()),
@@ -457,14 +462,14 @@ mod tests {
 
     #[test]
     fn rewrites_the_scratch_main_to_the_fixture() {
-        let out = normalizer().normalize(" --> src/main.rs:4:9\n", "tests/ui/a.rs");
+        let out = normalizer().normalize(" --> src/bin/f_a.rs:4:9\n", "tests/ui/a.rs");
         assert_eq!(out, " --> tests/ui/a.rs:4:9\n");
     }
 
     #[test]
     fn rewrites_the_absolute_scratch_main_to_the_fixture() {
         let out = normalizer().normalize(
-            "note: at /w/target/nocompile/host/project/src/main.rs:1:1\n",
+            "note: at /w/target/nocompile/host/project/src/bin/f_a.rs:1:1\n",
             "tests/ui/a.rs",
         );
         assert_eq!(out, "note: at tests/ui/a.rs:1:1\n");
@@ -501,8 +506,8 @@ mod tests {
     fn leaves_the_fixtures_own_source_text_alone() {
         // The snippet quotes the fixture. Rewriting inside it would misquote the
         // code under test and misalign the carets beneath.
-        let out = normalizer().normalize("2 |     let _x = \"src/main.rs\";\n", "tests/ui/a.rs");
-        assert_eq!(out, "2 |     let _x = \"src/main.rs\";\n");
+        let out = normalizer().normalize("2 |     let _x = \"src/bin/f_a.rs\";\n", "tests/ui/a.rs");
+        assert_eq!(out, "2 |     let _x = \"src/bin/f_a.rs\";\n");
     }
 
     #[test]
@@ -541,12 +546,13 @@ mod tests {
     fn new_reads_the_paths_it_is_given() {
         let n = Normalizer::new(
             &PathBuf::from("/s"),
-            &PathBuf::from("/s/project/src/main.rs"),
+            &PathBuf::from("/s/project/src/bin/f_a.rs"),
+            "src/bin/f_a.rs",
             &PathBuf::from("/h"),
             &[],
         );
         assert_eq!(n.scratch_root, "/s");
-        assert_eq!(n.scratch_main, "/s/project/src/main.rs");
+        assert_eq!(n.scratch_main, "/s/project/src/bin/f_a.rs");
         assert_eq!(n.manifest_dir, "/h");
     }
 
@@ -619,7 +625,7 @@ mod tests {
     fn the_fixtures_own_snippet_keeps_its_gutter_line_numbers() {
         let rendered = concat!(
             "error[E0308]: mismatched types\n",
-            " --> src/main.rs:4:17\n",
+            " --> src/bin/f_a.rs:4:17\n",
             "  |\n",
             "4 |     let _x: u8 = \"s\";\n",
             "  |             --   ^^^ expected `u8`\n",
@@ -664,7 +670,7 @@ mod tests {
             " --> /elsewhere/core/src/lib.rs:5:1\n",
             "5 | struct A;\n",
             "error[E0308]: mismatched types\n",
-            " --> src/main.rs:7:1\n",
+            " --> src/bin/f_a.rs:7:1\n",
             "7 | let _x: u8 = \"s\";\n",
         );
         assert_eq!(
@@ -744,7 +750,7 @@ mod tests {
         // file that exists in no user's repository, and stripped the one line
         // number the rule exists to keep.
         let rendered = concat!(
-            " ::: src/main.rs:2:5\n",
+            " ::: src/bin/f_a.rs:2:5\n",
             "  |\n",
             "2 |     core::bad!(\"s\");\n",
         );
@@ -763,10 +769,10 @@ mod tests {
         // The snippet is the code under test. Rewriting inside it makes the
         // golden misquote the fixture, and churn when the fixture is renamed.
         let out = normalizer().normalize(
-            "2 |     let _s = \"--> src/main.rs:1:1\";\n",
+            "2 |     let _s = \"--> src/bin/f_a.rs:1:1\";\n",
             "tests/ui/a.rs",
         );
-        assert_eq!(out, "2 |     let _s = \"--> src/main.rs:1:1\";\n");
+        assert_eq!(out, "2 |     let _s = \"--> src/bin/f_a.rs:1:1\";\n");
     }
 
     #[test]
