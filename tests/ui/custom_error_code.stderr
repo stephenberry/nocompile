@@ -1,0 +1,2 @@
+error: MYLIB-E001: expected a struct with named fields
+--> tests/ui/custom_error_code.rs:6:9

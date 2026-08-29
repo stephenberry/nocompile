@@ -45,6 +45,11 @@ pub enum Mode {
     /// to build on more than one toolchain**, which is most crates with a CI
     /// matrix. This crate's own UI suite runs in `Brief` for exactly that reason.
     ///
+    /// Keeping the message is also what makes a library's *own* error codes
+    /// testable. `rustc`'s `E0xxx` registry is closed, so the convention is a
+    /// token in the message -- `compile_error!("MYLIB-E001: ...")`. That token is
+    /// part of the primary message, so it lands in the golden and is compared.
+    ///
     /// The filter is applied to *both* sides of the comparison, so an `Exact`
     /// golden also passes in `Brief` mode. Switching is therefore a one-line
     /// change, and blessing afterwards shrinks the golden to match.

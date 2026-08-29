@@ -106,6 +106,34 @@ Two cheaper designs look tempting and both fail:
 
 `Brief` is the smallest comparison that still asserts something, which is why it keeps the primary message rather than just the code.
 
+### Error codes of your own
+
+`rustc`'s `E0xxx` codes are a closed registry. Each is backed by a `rustc --explain` entry compiled into the compiler, and there is no hook for a library to add one. `compile_error!` emits no code at all; `proc_macro::Diagnostic` is nightly-only and has no code field; `#[diagnostic::on_unimplemented]` hands you the message, the label and the note while the bracket stays `E0277`:
+
+```
+error[E0277]: MYLIB-E001: `u8` cannot be serialized
+--> tests/ui/not_serializable.rs:6:13
+```
+
+So put the identifier where it *is* yours, in the message:
+
+```rust
+compile_error!("MYLIB-E001: expected a struct with named fields");
+```
+
+That buys you what a code actually buys: a short, stable token that survives rewording, that users can search for, and that you can point at your own documentation.
+
+`Brief` keeps the primary message in full, so the token lands in the golden and is compared on every run. A `Brief` suite is already matching your error codes. It just isn't matching rustc's.
+
+This repo tests that claim rather than only asserting it: `tests/ui/custom_error_code.rs` is a `compile_error!` carrying a token, and its committed golden is the whole of what `Brief` compares.
+
+```
+error: MYLIB-E001: expected a struct with named fields
+--> tests/ui/custom_error_code.rs:6:9
+```
+
+No bracket, because `compile_error!` has no code. The token survives anyway.
+
 ## Zero dependencies, dev-dependencies included
 
 A crate whose selling point is "no dependencies" cannot have dev-dependencies either. A `[dev-dependencies]` entry shows up in `cargo tree` for anyone vendoring or auditing the source, and a harness that reaches for a helper crate to test itself has undermined its own pitch. `nocompile`'s own compile-fail suite is run by `nocompile`, and everything else is `assert_eq!` on strings.
