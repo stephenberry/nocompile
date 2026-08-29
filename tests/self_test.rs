@@ -127,7 +127,7 @@ fn a_rejected_fixture_with_a_correct_golden_passes() {
         "the span should point at the fixture, not the scratch project:\n{golden}"
     );
     assert!(
-        !golden.contains("nocompile-scratch") && !golden.contains("src/main.rs"),
+        !golden.contains("nocompile-scratch") && !golden.contains("src/bin/"),
         "the scratch project leaked into the golden:\n{golden}"
     );
 
@@ -349,12 +349,17 @@ fn a_fixture_error_worded_like_a_cargo_failure_reaches_the_golden() {
 /// Normalization must not rewrite the fixture's own source text. The snippet
 /// quotes the code under test; a substitution inside it misquotes the fixture
 /// and misaligns the carets beneath.
+///
+/// The generated bin path is replaced *globally* rather than only in a span
+/// header, which is safe only because the generated name carries a hash of the
+/// fixture's path. This pins the other half of that argument: a path that merely
+/// looks like one of ours is left alone.
 #[test]
 fn normalization_leaves_quoted_source_alone() {
     let sandbox = Sandbox::new("quoted-source");
     sandbox.write(
         "ui/quotes_a_path.rs",
-        "fn main() {\n    let _x: u8 = \"src/main.rs\";\n}\n",
+        "fn main() {\n    let _x: u8 = \"src/bin/f_not_ours.rs\";\n}\n",
     );
 
     let mut t = sandbox.cases();
@@ -363,7 +368,7 @@ fn normalization_leaves_quoted_source_alone() {
 
     let golden = sandbox.read("ui/quotes_a_path.stderr");
     assert!(
-        golden.contains("let _x: u8 = \"src/main.rs\""),
+        golden.contains("let _x: u8 = \"src/bin/f_not_ours.rs\""),
         "the fixture's source was rewritten inside its own snippet:\n{golden}"
     );
     assert!(
@@ -386,7 +391,7 @@ fn a_suite_that_registers_nothing_is_reported() {
     );
 }
 
-/// Every fixture in a run is written to the same scratch `src/main.rs`, and
+/// Every fixture in a run is written into the same scratch project, and
 /// `cargo test` runs test functions in parallel threads. Without a lock the two
 /// runs below compile each other's fixtures, and the reliable symptom is a
 /// broken fixture reported as passing.
@@ -786,5 +791,100 @@ fn a_dependency_warning_does_not_reach_a_fixtures_golden() {
     assert!(
         !golden.contains("unused"),
         "a dependency's warning reached the fixture's golden:\n{golden}"
+    );
+}
+
+/// A dependency that will not build leaves every fixture with no diagnostics and
+/// no artifact. Reporting that per fixture blames the fixtures for something
+/// none of them did, and buries the one line that says what to fix.
+#[test]
+fn a_dependency_that_does_not_build_is_reported_once_with_its_own_error() {
+    let sandbox = Sandbox::new("dependency-broken");
+    sandbox.write(
+        "helper/Cargo.toml",
+        "[package]\nname = \"helper\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[dependencies]\n",
+    );
+    sandbox.write(
+        "helper/src/lib.rs",
+        "pub fn broken() -> u8 { \"not a u8\" }\n",
+    );
+    sandbox.write("ui/a.rs", REJECTED);
+    sandbox.write("ui/b.rs", REJECTED);
+
+    let mut t = sandbox.cases();
+    t.dependency_path("helper", "helper");
+    t.compile_fail_dir("ui");
+
+    let outcome = t.overwrite(true).run();
+    assert!(!outcome.is_success());
+    assert_eq!(
+        outcome.setup_failures().len(),
+        1,
+        "one broken dependency should be reported once:\n{}",
+        outcome.report()
+    );
+    let report = outcome.report();
+    assert!(
+        report.contains("mismatched types"),
+        "the dependency's own error should be what is shown:\n{report}"
+    );
+    assert!(
+        !sandbox.path("ui/a.stderr").exists() && !sandbox.path("ui/b.stderr").exists(),
+        "bless wrote a golden from a run in which nothing compiled"
+    );
+}
+
+/// A fixture with no `fn main` is a documented case, and rustc reports it by
+/// naming the *crate* rather than a span in it. The crate is a bin target this
+/// harness generated, so its name must not reach the golden: nobody reading the
+/// suite has such a crate, and the name would move if the generated name ever
+/// did.
+#[test]
+fn a_fixture_without_main_does_not_record_harness_internals() {
+    let sandbox = Sandbox::new("no-main");
+    sandbox.write("ui/no_main.rs", "const _X: u8 = 0;\n");
+
+    let mut t = sandbox.cases();
+    t.compile_fail("ui/no_main.rs");
+    assert_passed(&t.overwrite(true).run());
+
+    let golden = sandbox.read("ui/no_main.stderr");
+    assert!(golden.contains("E0601"), "{golden}");
+    assert!(
+        !golden.contains("src/bin/") && !golden.contains("f_ui_no_main"),
+        "a generated bin name or path reached the golden:\n{golden}"
+    );
+    assert!(
+        golden.contains("$CRATE"),
+        "the generated crate should normalize to a placeholder:\n{golden}"
+    );
+}
+
+/// Registering another fixture must not change an existing fixture's golden.
+///
+/// The bin name is the crate name and rustc prints it, so a name derived from a
+/// fixture's position in the suite would rewrite unrelated committed goldens
+/// whenever a fixture was added.
+#[test]
+fn adding_a_fixture_does_not_disturb_another_fixtures_golden() {
+    let sandbox = Sandbox::new("golden-stability");
+    sandbox.write("ui/no_main.rs", "const _X: u8 = 0;\n");
+
+    let mut t = sandbox.cases();
+    t.compile_fail("ui/no_main.rs");
+    assert_passed(&t.overwrite(true).run());
+    let before = sandbox.read("ui/no_main.stderr");
+
+    // Sorts before `no_main.rs`, and sanitizes to the same text.
+    sandbox.write("ui/no-main.rs", "const _Y: u8 = 0;\n");
+    let mut t = sandbox.cases();
+    t.compile_fail_dir("ui");
+    let outcome = t.overwrite(true).run();
+    assert!(outcome.is_success(), "{}", outcome.report());
+
+    assert_eq!(
+        before,
+        sandbox.read("ui/no_main.stderr"),
+        "adding an unrelated fixture rewrote this one's golden"
     );
 }

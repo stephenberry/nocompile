@@ -59,13 +59,8 @@ impl Layout {
         self.project.join("Cargo.toml")
     }
 
-    /// Where fixture sources are written, one bin target each.
-    pub(crate) fn bin_dir(&self) -> PathBuf {
-        self.project.join("src").join("bin")
-    }
-
     pub(crate) fn bin_path(&self, bin: &str) -> PathBuf {
-        self.bin_dir().join(format!("{bin}.rs"))
+        self.project.join(bin_relative(bin))
     }
 }
 
@@ -112,27 +107,26 @@ fn sanitize(name: &str) -> String {
         .collect()
 }
 
-/// A bin target name for each fixture, in the order given.
+/// The bin target name for one fixture.
 ///
-/// Derived from the fixture's own path rather than its position, so inserting a
-/// fixture does not rename every bin after it and force a full rebuild. Cargo
-/// requires the names be unique, and two different paths can sanitize to the
-/// same text, so repeats get a numeric suffix.
-pub(crate) fn bin_names(relatives: &[String]) -> Vec<String> {
-    let mut names: Vec<String> = Vec::with_capacity(relatives.len());
-    for relative in relatives {
-        // Leading `f_` because a bin name has to start with something that is
-        // not a digit, and a fixture path is free to.
-        let base = format!("f_{}", sanitize_bin(relative));
-        let mut candidate = base.clone();
-        let mut n = 2;
-        while names.contains(&candidate) {
-            candidate = format!("{base}_{n}");
-            n += 1;
-        }
-        names.push(candidate);
-    }
-    names
+/// A pure function of the fixture's own path. That matters more than it looks:
+/// the bin name *is* the crate name, so rustc prints it (`main` function not
+/// found in crate `...`), and a name that depended on which other fixtures were
+/// registered would move a committed golden when an unrelated fixture was added.
+/// The trailing hash also removes the need to check for collisions against the
+/// rest of the suite, and caps the length -- a deep fixture path flattened whole
+/// can otherwise exceed the filesystem's limit on a file name.
+pub(crate) fn bin_name(relative: &str) -> String {
+    /// Long enough to read the fixture in the scratch directory, short enough
+    /// that the total stays well inside a 255-byte name.
+    const STEM: usize = 40;
+
+    let sanitized = sanitize_bin(relative);
+    let stem: String = sanitized.chars().take(STEM).collect();
+    // Distinct paths that sanitize alike -- `a/b.rs` and `a_b.rs`, or two names
+    // differing only in case, which are the same file on macOS and Windows --
+    // are separated here rather than by a counter.
+    format!("f_{stem}_{:08x}", fnv1a(relative))
 }
 
 /// Reduce a fixture path to the characters a bin name and a file name share.
@@ -148,6 +142,28 @@ fn sanitize_bin(relative: &str) -> String {
             }
         })
         .collect()
+}
+
+/// FNV-1a, written out rather than taken from `std`.
+///
+/// `DefaultHasher` is explicitly not guaranteed stable across releases, and a
+/// hash that changed with the toolchain would rename every bin and rewrite every
+/// golden that mentions one.
+fn fnv1a(text: &str) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in text.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
+/// The scratch project's path for a bin, relative to its package root.
+///
+/// One definition, used by the manifest and by normalization, so the `path =`
+/// cargo is given and the text the goldens rewrite cannot drift apart.
+pub(crate) fn bin_relative(bin: &str) -> String {
+    format!("src/bin/{bin}.rs")
 }
 
 /// Generate the scratch project's manifest.
@@ -254,7 +270,7 @@ mod tests {
 
     #[test]
     fn declares_one_bin_target_per_fixture() {
-        let m = manifest("2021", &[], &[], &["f_a".into(), "f_b".into()]);
+        let m = manifest("2021", &[], &[], &["f_a".to_string(), "f_b".to_string()]);
         assert!(
             m.contains("[[bin]]\nname = \"f_a\"\npath = \"src/bin/f_a.rs\"\n"),
             "{m}"
@@ -274,24 +290,44 @@ mod tests {
     }
 
     #[test]
-    fn bin_names_come_from_the_fixture_path() {
-        assert_eq!(
-            bin_names(&["tests/ui/a.rs".into(), "tests/ui/b-c.rs".into()]),
-            vec!["f_tests_ui_a".to_string(), "f_tests_ui_b_c".to_string()]
-        );
+    fn a_bin_name_is_readable_and_derived_from_the_path() {
+        let name = bin_name("tests/ui/a.rs");
+        assert!(name.starts_with("f_tests_ui_a_"), "{name}");
+        assert_eq!(bin_relative(&name), format!("src/bin/{name}.rs"));
     }
 
     #[test]
-    fn bin_names_are_unique_even_when_paths_sanitize_alike() {
-        // `a/b.rs` and `a_b.rs` both reduce to the same text.
-        assert_eq!(
-            bin_names(&["a/b.rs".into(), "a_b.rs".into(), "a-b.rs".into()]),
-            vec![
-                "f_a_b".to_string(),
-                "f_a_b_2".to_string(),
-                "f_a_b_3".to_string()
-            ]
-        );
+    fn a_bin_name_depends_on_nothing_but_its_own_path() {
+        // The name is the crate name and rustc prints it, so a golden moves if
+        // this ever depends on which other fixtures were registered.
+        assert_eq!(bin_name("tests/ui/a.rs"), bin_name("tests/ui/a.rs"));
+        assert_ne!(bin_name("tests/ui/a.rs"), bin_name("tests/ui/b.rs"));
+    }
+
+    #[test]
+    fn paths_that_sanitize_alike_still_get_different_names() {
+        // `a/b.rs`, `a_b.rs` and `a-b.rs` all reduce to the same text, and
+        // `A.rs`/`a.rs` are one file on a case-insensitive filesystem.
+        let names = [
+            bin_name("a/b.rs"),
+            bin_name("a_b.rs"),
+            bin_name("a-b.rs"),
+            bin_name("A.rs"),
+            bin_name("a.rs"),
+        ];
+        for (i, a) in names.iter().enumerate() {
+            for b in &names[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+    }
+
+    #[test]
+    fn a_deep_fixture_path_stays_inside_a_file_name_limit() {
+        let deep = format!("tests/ui/{}/{}.rs", "nested/".repeat(30), "z".repeat(200));
+        let name = bin_name(&deep);
+        assert!(name.len() < 60, "{} chars: {name}", name.len());
+        assert!(bin_relative(&name).len() < 80);
     }
 
     #[test]

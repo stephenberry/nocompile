@@ -30,6 +30,9 @@ struct Case {
     relative: String,
     /// Where to actually read it from.
     absolute: PathBuf,
+    /// The scratch project's bin target for this fixture. Derived from
+    /// `relative` alone, so it cannot depend on what else was registered.
+    bin: String,
     kind: Kind,
 }
 
@@ -189,7 +192,7 @@ impl TestCases {
         let layout = Layout::new(&self.manifest_dir, &self.host_pkg_name);
 
         // Held for the whole run. Every fixture is written to the same
-        // `src/main.rs`, so concurrent runs would compile each other's fixtures.
+        // scratch project, so concurrent runs would compile each other's fixtures.
         let _lock = match compile::lock(&layout) {
             Ok(lock) => lock,
             Err(error) => {
@@ -204,16 +207,7 @@ impl TestCases {
             }
         };
 
-        // One bin target per fixture, named from the fixture's own path.
-        let bins = scratch::bin_names(
-            &self
-                .cases
-                .iter()
-                .map(|case| case.relative.clone())
-                .collect::<Vec<_>>(),
-        );
-
-        if let Err(failure) = self.prepare(&layout, &bins) {
+        if let Err(failure) = self.prepare(&layout) {
             setup.push(failure);
             return Outcome::new(setup, Vec::new());
         }
@@ -240,19 +234,26 @@ impl TestCases {
             return Outcome::new(setup, Vec::new());
         }
 
+        // Nothing built at all, which no single fixture explains. Almost always
+        // a declared dependency that does not compile, and its errors are the
+        // only thing that says so.
+        if let Some(message) = build.nothing_built() {
+            setup.push(Failure::Cargo { message });
+            return Outcome::new(setup, Vec::new());
+        }
+
         let cases = self
             .cases
             .iter()
-            .zip(&bins)
-            .map(|(case, bin)| {
+            .map(|case| {
                 let normalizer = Normalizer::new(
                     &layout.root,
-                    &layout.bin_path(bin),
-                    &format!("src/bin/{bin}.rs"),
+                    &layout.bin_path(&case.bin),
+                    &case.bin,
                     &self.manifest_dir,
                     &self.dependencies,
                 );
-                let result = self.check_case(case, bin, &normalizer, &build);
+                let result = self.check_case(case, &normalizer, &build);
                 CaseOutcome::new(PathBuf::from(&case.relative), case.kind, result)
             })
             .collect();
@@ -270,7 +271,7 @@ impl TestCases {
     }
 
     /// Create the scratch project, stage every fixture, and write the manifest.
-    fn prepare(&self, layout: &Layout, bins: &[String]) -> Result<(), Failure> {
+    fn prepare(&self, layout: &Layout) -> Result<(), Failure> {
         // `write_if_changed` creates the directories it writes into, so only the
         // target directory -- which cargo is handed rather than written to --
         // needs creating here.
@@ -284,7 +285,7 @@ impl TestCases {
             )
         })?;
 
-        for (case, bin) in self.cases.iter().zip(bins) {
+        for case in &self.cases {
             let source = fs::read_to_string(&case.absolute).map_err(|error| {
                 io_failure(
                     format!("could not read the fixture {}", case.relative),
@@ -297,22 +298,21 @@ impl TestCases {
             // and guessing it wrong writes harness-injected source into the
             // golden under the fixture's own name. A fixture without `fn main`
             // gets a plain E0601, which says exactly what to do about it.
-            let path = layout.bin_path(bin);
+            let path = layout.bin_path(&case.bin);
             compile::write_if_changed(&path, &source).map_err(|error| {
                 io_failure(format!("could not write {}", path.display()), error)
             })?;
         }
 
-        // A fixture removed since the last run leaves its source behind.
-        // `autobins = false` already stops cargo compiling it, so this is only
-        // to keep the scratch directory honest about what the suite contains.
-        prune_stale_bins(layout, bins);
-
+        // A fixture removed since a previous run leaves its source behind, and
+        // that is fine: `autobins = false` means the manifest, not the
+        // directory, decides what cargo compiles.
+        let bins: Vec<String> = self.cases.iter().map(|case| case.bin.clone()).collect();
         let manifest = scratch::manifest(
             &self.edition,
             &self.dependencies,
             &self.raw_manifest_lines,
-            bins,
+            &bins,
         );
         let path = layout.manifest();
         compile::write_if_changed(&path, &manifest)
@@ -322,31 +322,29 @@ impl TestCases {
     fn check_case(
         &self,
         case: &Case,
-        bin: &str,
         normalizer: &Normalizer,
         build: &compile::Build,
     ) -> Result<(), Failure> {
         match case.kind {
-            Kind::CompileFail => self.check_compile_fail(case, bin, normalizer, build),
-            Kind::Pass => self.check_pass(case, bin, normalizer, build),
+            Kind::CompileFail => self.check_compile_fail(case, normalizer, build),
+            Kind::Pass => self.check_pass(case, normalizer, build),
         }
     }
 
     fn check_compile_fail(
         &self,
         case: &Case,
-        bin: &str,
         normalizer: &Normalizer,
         build: &compile::Build,
     ) -> Result<(), Failure> {
         // The most important failure the harness reports, and the reason it gets
         // its own message rather than a diff against an empty golden. Cargo
         // producing an artifact is the positive evidence; nothing else is.
-        if build.compiled(bin) {
+        if build.compiled(&case.bin) {
             return Err(Failure::Compiled);
         }
 
-        let diagnostics = build.diagnostics(bin);
+        let diagnostics = build.diagnostics(&case.bin);
         let actual = compare::filter(
             &normalizer.normalize(&diagnostics, &case.relative),
             self.mode,
@@ -405,20 +403,19 @@ impl TestCases {
     fn check_pass(
         &self,
         case: &Case,
-        bin: &str,
         normalizer: &Normalizer,
         build: &compile::Build,
     ) -> Result<(), Failure> {
         // An artifact is the assertion. Absence of diagnostics would not be:
         // a target cargo never got to has none either.
-        if build.compiled(bin) {
+        if build.compiled(&case.bin) {
             return Ok(());
         }
         // Normalized even though there is no golden here, because the message
         // has to name the fixture the reader wrote rather than the scratch file
         // the harness generated.
         Err(Failure::DidNotCompile {
-            stderr: normalizer.normalize(&build.diagnostics(bin), &case.relative),
+            stderr: normalizer.normalize(&build.diagnostics(&case.bin), &case.relative),
         })
     }
 
@@ -432,9 +429,17 @@ impl TestCases {
     fn push_file(&mut self, path: &Path, kind: Kind) {
         let absolute = lexical_join(&self.manifest_dir, path);
         let relative = relative_to(&self.manifest_dir, &absolute);
+        self.push_case(relative, absolute, kind);
+    }
+
+    /// The one place a `Case` is built, so its bin name is never left to a
+    /// caller to keep in step with its path.
+    fn push_case(&mut self, relative: String, absolute: PathBuf, kind: Kind) {
+        let bin = scratch::bin_name(&relative);
         self.cases.push(Case {
             relative,
             absolute,
+            bin,
             kind,
         });
     }
@@ -484,11 +489,7 @@ impl TestCases {
         files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
         for file in files {
             let relative = relative_to(&self.manifest_dir, &file);
-            self.cases.push(Case {
-                relative,
-                absolute: file,
-                kind,
-            });
+            self.push_case(relative, file, kind);
         }
     }
 }
@@ -511,23 +512,6 @@ fn golden_path(fixture: &Path) -> PathBuf {
 /// generated manifest and the reports read cleanly. Not a canonicalization: no
 /// symlink is followed, because `CARGO_MANIFEST_DIR` is not canonical either and
 /// the two must stay comparable for normalization to match.
-/// Delete fixture sources in the scratch project that this run did not stage.
-///
-/// Best effort: a file that cannot be removed is not a reason to fail a suite,
-/// because `autobins = false` already means cargo will not compile it.
-fn prune_stale_bins(layout: &Layout, bins: &[String]) {
-    let Ok(entries) = fs::read_dir(layout.bin_dir()) else {
-        return;
-    };
-    let keep: Vec<PathBuf> = bins.iter().map(|bin| layout.bin_path(bin)).collect();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "rs") && !keep.contains(&path) {
-            let _ = fs::remove_file(path);
-        }
-    }
-}
-
 fn lexical_join(base: &Path, path: &Path) -> PathBuf {
     let joined = if path.is_absolute() {
         path.to_path_buf()

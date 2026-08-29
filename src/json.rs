@@ -7,24 +7,25 @@
 //! parsing would corrupt exactly the text the goldens compare.
 //!
 //! So this is a complete parser for the grammar, and no more than that. It
-//! builds a small tree rather than streaming, because a cargo message is one
-//! line and the clarity is worth more than the allocation. Numbers are parsed
-//! and kept, though nothing here reads one; a parser that silently skipped a
-//! construct would be a parser that silently accepts malformed input.
+//! builds a small tree rather than streaming, because `absorb` reads `reason`
+//! before deciding which other fields it wants and cargo does not promise field
+//! order. Values that no lookup can reach -- numbers, booleans, arrays -- are
+//! checked against the grammar and then discarded rather than materialized: they
+//! still have to parse, because a parser that skipped a construct would be a
+//! parser that accepts malformed input, but nothing can read one.
 
 use std::fmt::{self, Display, Formatter};
 
 /// A parsed JSON value.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Value {
-    Null,
-    Bool(bool),
-    Number(f64),
     String(String),
-    Array(Vec<Value>),
     /// Kept as pairs rather than a map: cargo's objects are small, and this
     /// preserves order, which makes a failure message reproducible.
     Object(Vec<(String, Value)>),
+    /// A number, boolean, null or array: parsed, checked, and discarded. A field
+    /// is only ever reached through object keys, so nothing can read one.
+    Other,
 }
 
 impl Value {
@@ -75,6 +76,7 @@ pub(crate) fn parse(input: &str) -> Result<Value, Error> {
     let mut parser = Parser {
         bytes: input.as_bytes(),
         at: 0,
+        depth: 0,
     };
     parser.skip_whitespace();
     let value = parser.value()?;
@@ -88,7 +90,14 @@ pub(crate) fn parse(input: &str) -> Result<Value, Error> {
 struct Parser<'a> {
     bytes: &'a [u8],
     at: usize,
+    /// How deep the current value is nested. `value` recurses, and a stack
+    /// overflow aborts the process rather than raising a catchable error, so
+    /// depth is bounded. Cargo's messages nest about a dozen deep.
+    depth: usize,
 }
+
+/// Far past anything cargo emits, far short of a stack a test binary has.
+const MAX_DEPTH: usize = 128;
 
 impl<'a> Parser<'a> {
     fn error(&self, message: &str) -> Error {
@@ -119,22 +128,36 @@ impl<'a> Parser<'a> {
 
     fn value(&mut self) -> Result<Value, Error> {
         match self.peek() {
-            Some(b'{') => self.object(),
-            Some(b'[') => self.array(),
+            Some(b'{') => self.nested(Parser::object),
+            Some(b'[') => self.nested(Parser::array),
             Some(b'"') => Ok(Value::String(self.string()?)),
-            Some(b't') => self.literal("true", Value::Bool(true)),
-            Some(b'f') => self.literal("false", Value::Bool(false)),
-            Some(b'n') => self.literal("null", Value::Null),
+            Some(b't') => self.literal("true"),
+            Some(b'f') => self.literal("false"),
+            Some(b'n') => self.literal("null"),
             Some(b'-' | b'0'..=b'9') => self.number(),
             Some(_) => Err(self.error("expected a value")),
             None => Err(self.error("unexpected end of input")),
         }
     }
 
-    fn literal(&mut self, word: &str, value: Value) -> Result<Value, Error> {
+    /// Run a container parser one level deeper, refusing to recurse forever.
+    fn nested(
+        &mut self,
+        parse: fn(&mut Parser<'a>) -> Result<Value, Error>,
+    ) -> Result<Value, Error> {
+        if self.depth >= MAX_DEPTH {
+            return Err(self.error("nested too deeply"));
+        }
+        self.depth += 1;
+        let value = parse(self);
+        self.depth -= 1;
+        value
+    }
+
+    fn literal(&mut self, word: &str) -> Result<Value, Error> {
         if self.bytes[self.at..].starts_with(word.as_bytes()) {
             self.at += word.len();
-            return Ok(value);
+            return Ok(Value::Other);
         }
         Err(self.error(&format!("expected `{word}`")))
     }
@@ -170,23 +193,24 @@ impl<'a> Parser<'a> {
 
     fn array(&mut self) -> Result<Value, Error> {
         self.expect(b'[')?;
-        let mut items = Vec::new();
 
         self.skip_whitespace();
         if self.peek() == Some(b']') {
             self.at += 1;
-            return Ok(Value::Array(items));
+            return Ok(Value::Other);
         }
 
         loop {
             self.skip_whitespace();
-            items.push(self.value()?);
+            // Parsed for its syntax and dropped: no lookup descends into an
+            // array, so keeping the items would only be to throw them away.
+            self.value()?;
             self.skip_whitespace();
             match self.peek() {
                 Some(b',') => self.at += 1,
                 Some(b']') => {
                     self.at += 1;
-                    return Ok(Value::Array(items));
+                    return Ok(Value::Other);
                 }
                 _ => return Err(self.error("expected `,` or `]`")),
             }
@@ -213,11 +237,16 @@ impl<'a> Parser<'a> {
                 // A control character must be escaped to be legal here.
                 0x00..=0x1F => return Err(self.error("unescaped control character in string")),
                 _ => {
-                    // The input is a `&str`, so a byte that is not one of the
-                    // ASCII cases above begins a well-formed UTF-8 sequence.
-                    // Copy the whole of it rather than the lead byte.
+                    // Every byte that needs handling is ASCII, and no ASCII byte
+                    // occurs inside a multi-byte UTF-8 sequence, so the run up
+                    // to the next one is a whole number of characters. Copying
+                    // it in one go avoids decoding lengths by hand -- and this
+                    // is the bulk of the work, since `rendered` is by far the
+                    // largest field in a message.
                     let start = self.at;
-                    self.at += utf8_len(byte);
+                    while !matches!(self.peek(), None | Some(b'"' | b'\\' | 0x00..=0x1F)) {
+                        self.at += 1;
+                    }
                     match std::str::from_utf8(&self.bytes[start..self.at]) {
                         Ok(text) => out.push_str(text),
                         Err(_) => return Err(self.error("invalid UTF-8 in string")),
@@ -297,8 +326,6 @@ impl<'a> Parser<'a> {
     }
 
     fn number(&mut self) -> Result<Value, Error> {
-        let start = self.at;
-
         if self.peek() == Some(b'-') {
             self.at += 1;
         }
@@ -327,29 +354,13 @@ impl<'a> Parser<'a> {
             self.digits();
         }
 
-        // The slice is ASCII digits and punctuation, so it is valid UTF-8 and
-        // in the grammar `f64` accepts.
-        let text = std::str::from_utf8(&self.bytes[start..self.at])
-            .map_err(|_| self.error("number is not valid UTF-8"))?;
-        text.parse::<f64>()
-            .map(Value::Number)
-            .map_err(|_| self.error("number is out of range"))
+        Ok(Value::Other)
     }
 
     fn digits(&mut self) {
         while matches!(self.peek(), Some(b'0'..=b'9')) {
             self.at += 1;
         }
-    }
-}
-
-/// The length in bytes of the UTF-8 sequence beginning with `lead`.
-fn utf8_len(lead: u8) -> usize {
-    match lead {
-        0x00..=0x7F => 1,
-        0xC0..=0xDF => 2,
-        0xE0..=0xEF => 3,
-        _ => 4,
     }
 }
 
@@ -421,34 +432,41 @@ mod tests {
         assert_eq!(s(r#""\u00e9\u2192""#).as_str(), Some("é→"));
     }
 
+    /// The property that matters for a value nothing reads: it is consumed
+    /// exactly, so the field *after* it is still found.
     #[test]
-    fn parses_nesting_and_the_other_value_kinds() {
-        let value = s(r#"{"a":[1,-2.5,1e3,true,false,null,{},[]],"b":{}}"#);
-        let Some(Value::Array(items)) = value.get("a") else {
-            panic!("expected an array");
-        };
-        assert_eq!(items.len(), 8);
-        assert_eq!(items[0], Value::Number(1.0));
-        assert_eq!(items[1], Value::Number(-2.5));
-        assert_eq!(items[2], Value::Number(1000.0));
-        assert_eq!(items[3], Value::Bool(true));
-        assert_eq!(items[4], Value::Bool(false));
-        assert_eq!(items[5], Value::Null);
+    fn skipped_values_are_consumed_exactly() {
+        let value = s(r#"{"skip":[1,-2.5,1e3,true,false,null,{},[[[]]]],"want":"here"}"#);
+        assert_eq!(value.path_str(&["want"]), Some("here"));
+        assert_eq!(value.get("skip"), Some(&Value::Other));
     }
 
     #[test]
     fn accepts_whitespace_between_every_token() {
-        assert_eq!(
-            s(" { \"a\" : [ 1 , 2 ] } ").get("a"),
-            Some(&Value::Array(vec![Value::Number(1.0), Value::Number(2.0)]))
-        );
+        let value = s(" { \"a\" : [ 1 , 2 ] , \"b\" : \"x\" } ");
+        assert_eq!(value.path_str(&["b"]), Some("x"));
     }
 
     #[test]
     fn accepts_empty_containers_and_the_empty_string() {
         assert_eq!(s("{}"), Value::Object(Vec::new()));
-        assert_eq!(s("[]"), Value::Array(Vec::new()));
+        assert_eq!(s("[]"), Value::Other);
         assert_eq!(s(r#""""#), Value::String(String::new()));
+    }
+
+    /// `value` recurses, and a stack overflow aborts the process rather than
+    /// raising an error a test harness could report.
+    #[test]
+    fn refuses_input_nested_past_the_limit() {
+        let deep = format!("{}{}", "[".repeat(5000), "]".repeat(5000));
+        let error = parse(&deep).expect_err("should refuse");
+        assert!(error.to_string().contains("nested too deeply"), "{error}");
+    }
+
+    #[test]
+    fn accepts_nesting_well_past_what_cargo_emits() {
+        let ok = format!("{}{}", "[".repeat(100), "]".repeat(100));
+        assert!(parse(&ok).is_ok());
     }
 
     /// Malformed input has to be loud. A parser that guessed would put the
@@ -496,6 +514,9 @@ mod tests {
     fn duplicate_keys_keep_the_first() {
         // Cargo never emits one; fixing the behaviour keeps it from being a
         // surprise if it ever does.
-        assert_eq!(s(r#"{"a":1,"a":2}"#).get("a"), Some(&Value::Number(1.0)));
+        assert_eq!(
+            s(r#"{"a":"first","a":"second"}"#).path_str(&["a"]),
+            Some("first")
+        );
     }
 }

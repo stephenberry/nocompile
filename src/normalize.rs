@@ -37,15 +37,22 @@ pub(crate) const CARGO_REGISTRY: &str = "$CARGO_REGISTRY";
 pub(crate) const CARGO_HOME: &str = "$CARGO_HOME";
 /// Placeholder for the toolchain's own source, wherever it is unpacked.
 pub(crate) const RUST: &str = "$RUST";
+/// Placeholder for the generated crate a fixture is compiled as.
+pub(crate) const CRATE: &str = "$CRATE";
 
-/// The path rewrites for one run. Built once and reused for every fixture; only
-/// [`Normalizer::normalize`]'s `fixture` argument changes between them.
+/// The path rewrites for one fixture.
+///
+/// Built per fixture rather than per run, because two of its fields name the
+/// scratch file and bin target this fixture in particular was compiled as.
 pub(crate) struct Normalizer {
     /// Absolute path of the scratch source file this fixture was written to.
-    scratch_main: String,
+    scratch_absolute: String,
     /// The same file as cargo names it: relative to the scratch package root,
     /// which is the form it takes in a span header for the crate being compiled.
     scratch_relative: String,
+    /// The generated bin target's name, which is also the crate name rustc
+    /// prints in a diagnostic about the crate as a whole.
+    bin: String,
     /// Absolute path of the scratch root, covering both the generated project
     /// and its private target directory.
     scratch_root: String,
@@ -61,8 +68,8 @@ pub(crate) struct Normalizer {
 impl Normalizer {
     pub(crate) fn new(
         scratch_root: &Path,
-        scratch_main: &Path,
-        scratch_relative: &str,
+        scratch_absolute: &Path,
+        bin: &str,
         manifest_dir: &Path,
         dependencies: &[Dependency],
     ) -> Self {
@@ -76,8 +83,9 @@ impl Normalizer {
         dependencies.sort_by_key(|(path, _)| std::cmp::Reverse(path.len()));
 
         Self {
-            scratch_main: scratch_main.display().to_string(),
-            scratch_relative: scratch_relative.to_string(),
+            scratch_absolute: scratch_absolute.display().to_string(),
+            scratch_relative: crate::scratch::bin_relative(bin),
+            bin: bin.to_string(),
             scratch_root: scratch_root.display().to_string(),
             manifest_dir: manifest_dir.display().to_string(),
             cargo_home: cargo_home().map(|home| home.display().to_string()),
@@ -137,17 +145,22 @@ impl Normalizer {
     /// Replace every machine-specific path in one line with its placeholder.
     fn rewrite_paths(&self, line: &str, fixture: &str) -> String {
         // Absolute scratch paths first: the scratch main path *ends* in
-        // `src/main.rs`, so rewriting the relative form first would corrupt
+        // the bin's relative path, so rewriting that form first would corrupt
         // it, and the scratch root is a prefix of it.
-        let line = replace_dir(line, &self.scratch_main, fixture);
+        let line = replace_dir(line, &self.scratch_absolute, fixture);
         let line = replace_dir(&line, &self.scratch_root, SCRATCH);
-        // Cargo reports paths in the package under compilation relative to
-        // that package's root, so the fixture's own file appears bare as
-        // `src/bin/<name>.rs`. Anchored to a span header rather than replaced
-        // globally: a fixture is free to contain that literal text, and a path
-        // dependency is free to have a file of that name, and rewriting either
-        // to the fixture path would put a lie in the golden.
-        let line = rewrite_span_target(&line, &self.scratch_relative, fixture);
+        // Cargo reports paths in the package under compilation relative to that
+        // package's root, so the fixture's own file appears bare as
+        // `src/bin/<name>.rs`. Replaced everywhere it occurs rather than only in
+        // a span header, because rustc also names it in prose -- "consider
+        // adding a `main` function to src/bin/<name>.rs" -- and a golden must
+        // not record a path the reader has no such file at. Safe to do globally
+        // because the name carries a hash of the fixture's path: no fixture can
+        // contain the string by accident.
+        let line = line.replace(&self.scratch_relative, fixture);
+        // The bin name is also the crate name, and rustc prints it for a
+        // diagnostic about the crate rather than a span in it.
+        let line = line.replace(&self.bin, CRATE);
 
         // Before `CARGO_HOME`, which is a sibling of the toolchain directory
         // rather than a parent of it, so the two never compete -- but the
@@ -310,23 +323,6 @@ fn is_snippet_row(line: &str) -> bool {
     )
 }
 
-/// Rewrite the target of a span header, and only there.
-///
-/// Built on the same two helpers the line-number rule uses, so the two can never
-/// disagree about what a span header is or which file it names. They did once:
-/// this matched `--> ` anywhere on the line, so a fixture whose own source
-/// quoted that text had the quote rewritten, and it ignored `::: ` entirely, so
-/// a secondary span back into the fixture was treated as foreign and stripped.
-fn rewrite_span_target(line: &str, from: &str, to: &str) -> String {
-    match span_target(line) {
-        Some(target) if points_into(target, from) => {
-            let head = &line[..line.len() - target.len()];
-            format!("{head}{to}{}", &target[from.len()..])
-        }
-        _ => line.to_string(),
-    }
-}
-
 /// Rewrite a toolchain source path to [`RUST`].
 ///
 /// Three shapes reach a diagnostic: a rustup toolchain, whose path carries both
@@ -440,8 +436,9 @@ mod tests {
 
     fn normalizer() -> Normalizer {
         Normalizer {
-            scratch_main: "/w/target/nocompile/host/project/src/bin/f_a.rs".into(),
+            scratch_absolute: "/w/target/nocompile/host/project/src/bin/f_a.rs".into(),
             scratch_relative: "src/bin/f_a.rs".into(),
+            bin: "f_a".into(),
             scratch_root: "/w/target/nocompile/host".into(),
             manifest_dir: "/w".into(),
             cargo_home: Some("/home/u/.cargo".into()),
@@ -505,9 +502,39 @@ mod tests {
     #[test]
     fn leaves_the_fixtures_own_source_text_alone() {
         // The snippet quotes the fixture. Rewriting inside it would misquote the
-        // code under test and misalign the carets beneath.
-        let out = normalizer().normalize("2 |     let _x = \"src/bin/f_a.rs\";\n", "tests/ui/a.rs");
-        assert_eq!(out, "2 |     let _x = \"src/bin/f_a.rs\";\n");
+        // code under test and misalign the carets beneath. `src/main.rs` is the
+        // kind of path a fixture really might contain; the generated bin name is
+        // not, which is what makes replacing *that* one globally safe.
+        let out = normalizer().normalize("2 |     let _x = \"src/main.rs\";\n", "tests/ui/a.rs");
+        assert_eq!(out, "2 |     let _x = \"src/main.rs\";\n");
+    }
+
+    #[test]
+    fn rewrites_the_generated_bin_path_outside_a_span_header() {
+        // rustc names it in prose for a fixture with no `fn main`, and a golden
+        // must not record a file the reader does not have.
+        let out = normalizer().normalize(
+            "  | consider adding a `main` function to `src/bin/f_a.rs`\n",
+            "tests/ui/a.rs",
+        );
+        assert_eq!(
+            out,
+            "  | consider adding a `main` function to `tests/ui/a.rs`\n"
+        );
+    }
+
+    #[test]
+    fn rewrites_the_generated_crate_name() {
+        // The bin name is the crate name. It is a harness detail, and it would
+        // otherwise be the one thing in the golden that no reader can explain.
+        let out = normalizer().normalize(
+            "error[E0601]: `main` function not found in crate `f_a`\n",
+            "tests/ui/a.rs",
+        );
+        assert_eq!(
+            out,
+            "error[E0601]: `main` function not found in crate `$CRATE`\n"
+        );
     }
 
     #[test]
@@ -547,12 +574,12 @@ mod tests {
         let n = Normalizer::new(
             &PathBuf::from("/s"),
             &PathBuf::from("/s/project/src/bin/f_a.rs"),
-            "src/bin/f_a.rs",
+            "f_a",
             &PathBuf::from("/h"),
             &[],
         );
         assert_eq!(n.scratch_root, "/s");
-        assert_eq!(n.scratch_main, "/s/project/src/bin/f_a.rs");
+        assert_eq!(n.scratch_absolute, "/s/project/src/bin/f_a.rs");
         assert_eq!(n.manifest_dir, "/h");
     }
 
@@ -762,17 +789,6 @@ mod tests {
                 "2 |     core::bad!(\"s\");\n",
             )
         );
-    }
-
-    #[test]
-    fn a_span_header_quoted_in_the_fixtures_own_source_is_left_alone() {
-        // The snippet is the code under test. Rewriting inside it makes the
-        // golden misquote the fixture, and churn when the fixture is renamed.
-        let out = normalizer().normalize(
-            "2 |     let _s = \"--> src/bin/f_a.rs:1:1\";\n",
-            "tests/ui/a.rs",
-        );
-        assert_eq!(out, "2 |     let _s = \"--> src/bin/f_a.rs:1:1\";\n");
     }
 
     #[test]

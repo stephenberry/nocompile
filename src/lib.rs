@@ -89,7 +89,7 @@
 //!
 //! # Concurrency
 //!
-//! Every fixture in a run is written to the same scratch `src/main.rs`, so a run
+//! Every fixture in a run is written into the same scratch project, so a run
 //! holds an exclusive lock on its scratch project and concurrent runs serialize.
 //! Two `#[test]` functions each calling [`cases!`] is safe, as is `cargo
 //! nextest` or two `cargo test` invocations at once -- without the lock they

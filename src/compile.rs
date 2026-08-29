@@ -28,6 +28,10 @@ pub(crate) struct Build {
     /// evidence that a target compiled. Absence of errors is not: a target that
     /// was never built also has none.
     compiled: HashSet<String>,
+    /// Rendered diagnostics from packages that are *not* the scratch project --
+    /// a path dependency that failed to build. Not attributable to any fixture,
+    /// but the only description of why every fixture produced nothing.
+    foreign: Vec<String>,
     /// Cargo's own stderr. Only read when the build never started.
     pub(crate) stderr: String,
     /// Whether cargo got as far as building anything. False means cargo failed
@@ -47,6 +51,24 @@ impl Build {
 
     pub(crate) fn compiled(&self, bin: &str) -> bool {
         self.compiled.contains(bin)
+    }
+
+    /// Why nothing was built, when nothing was built.
+    ///
+    /// A dependency that fails to compile leaves every fixture with no
+    /// diagnostics and no artifact, which on its own reads as a harness bug. The
+    /// dependency's own errors say what actually happened, so they are kept
+    /// aside rather than discarded for belonging to another package.
+    pub(crate) fn nothing_built(&self) -> Option<String> {
+        if !self.messages.is_empty() || !self.compiled.is_empty() {
+            return None;
+        }
+        let mut report = self.foreign.concat();
+        if report.trim().is_empty() {
+            report = self.stderr.clone();
+        }
+        let report = report.trim_end().to_string();
+        (!report.is_empty()).then_some(report)
     }
 }
 
@@ -108,38 +130,64 @@ pub(crate) fn build(layout: &Layout) -> io::Result<Build> {
     let mut build = Build {
         messages: HashMap::new(),
         compiled: HashSet::new(),
+        foreign: Vec::new(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         started: false,
     };
 
+    let manifest = layout.manifest();
     for line in stdout.lines() {
-        if line.trim().is_empty() {
+        // Cargo forwards anything the compiler or a proc macro writes to stdout
+        // into this stream verbatim. A `println!` while debugging a derive is
+        // routine, and it is not cargo's JSON: skip it rather than fail the run
+        // over output that has nothing to do with the fixtures.
+        if !line.starts_with('{') {
             continue;
         }
-        // A line cargo emitted that will not parse is not something to guess
-        // about: the alternative to failing here is a silently short golden.
+        // A line that opens like a cargo message but will not parse is a
+        // different matter, and not something to guess about: the alternative to
+        // failing here is a silently short golden.
         let message = json::parse(line).map_err(|error| {
             io::Error::other(format!("could not parse cargo's JSON output: {error}"))
         })?;
-        absorb(&mut build, &message);
+        absorb(&mut build, &message, &manifest);
     }
 
     Ok(build)
 }
 
 /// File one cargo message under the target it belongs to.
-fn absorb(build: &mut Build, message: &json::Value) {
+///
+/// `manifest` is the scratch project's own manifest path, and every record is
+/// checked against it. Target names are not a namespace: a declared dependency
+/// is free to be called the same thing as a generated bin, and without this a
+/// dependency's `compiler-artifact` would stand as proof that a fixture
+/// compiled -- passing a `pass` fixture that never built, and reporting a
+/// `compile_fail` fixture as having compiled. Anything a proc macro prints to
+/// stdout would forge the same evidence.
+fn absorb(build: &mut Build, message: &json::Value, manifest: &Path) {
     let Some(reason) = message.path_str(&["reason"]) else {
         return;
     };
+    let ours = message
+        .path_str(&["manifest_path"])
+        .is_some_and(|path| Path::new(path) == manifest);
     let target = message.path_str(&["target", "name"]);
 
     match reason {
         "compiler-message" => {
-            let Some(target) = target else { return };
             let Some(rendered) = message.path_str(&["message", "rendered"]) else {
                 return;
             };
+            if !ours {
+                // Another package's diagnostic. Kept only to explain a run in
+                // which no fixture built at all.
+                if message.path_str(&["message", "level"]) == Some("error") {
+                    build.foreign.push(rendered.to_string());
+                }
+                return;
+            }
+            let Some(target) = target else { return };
             // `failure-note` is the "For more information about this error"
             // footer, which is about the *run* rather than the code. Every other
             // level is the compiler talking about the fixture, and is kept:
@@ -155,7 +203,7 @@ fn absorb(build: &mut Build, message: &json::Value) {
                 .push(rendered.to_string());
         }
         "compiler-artifact" => {
-            if let Some(target) = target {
+            if let (true, Some(target)) = (ours, target) {
                 build.compiled.insert(target.to_string());
             }
         }
@@ -205,4 +253,153 @@ pub(crate) fn write_if_changed(path: &Path, contents: &str) -> io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(path, contents)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const OURS: &str = "/scratch/Cargo.toml";
+
+    fn empty() -> Build {
+        Build {
+            messages: HashMap::new(),
+            compiled: HashSet::new(),
+            foreign: Vec::new(),
+            stderr: String::new(),
+            started: false,
+        }
+    }
+
+    /// Feed `build` one cargo message written the way cargo writes it.
+    fn feed(build: &mut Build, line: &str) {
+        let message = json::parse(line).expect("valid cargo json");
+        absorb(build, &message, Path::new(OURS));
+    }
+
+    fn message(manifest: &str, target: &str, level: &str, rendered: &str) -> String {
+        // The newlines in a rendered diagnostic are `\n` escapes on the wire.
+        let rendered = rendered.replace('\n', "\\n");
+        format!(
+            r#"{{"reason":"compiler-message","manifest_path":"{manifest}","target":{{"name":"{target}"}},"message":{{"level":"{level}","rendered":"{rendered}"}}}}"#
+        )
+    }
+
+    fn artifact(manifest: &str, target: &str) -> String {
+        format!(
+            r#"{{"reason":"compiler-artifact","manifest_path":"{manifest}","target":{{"name":"{target}"}}}}"#
+        )
+    }
+
+    #[test]
+    fn files_a_diagnostic_under_its_own_target() {
+        let mut build = empty();
+        feed(&mut build, &message(OURS, "f_a", "error", "error: one\n"));
+        feed(&mut build, &message(OURS, "f_b", "error", "error: two\n"));
+        feed(
+            &mut build,
+            &message(OURS, "f_a", "warning", "warning: three\n"),
+        );
+
+        assert_eq!(build.diagnostics("f_a"), "error: one\nwarning: three\n");
+        assert_eq!(build.diagnostics("f_b"), "error: two\n");
+        assert_eq!(build.diagnostics("f_missing"), "");
+    }
+
+    #[test]
+    fn drops_the_explain_footer() {
+        // `For more information about this error...` is about the run, not the
+        // code, and would otherwise be blessed into every golden.
+        let mut build = empty();
+        feed(
+            &mut build,
+            &message(OURS, "f_a", "failure-note", "For more information...\n"),
+        );
+        assert_eq!(build.diagnostics("f_a"), "");
+    }
+
+    #[test]
+    fn an_artifact_is_what_proves_a_target_compiled() {
+        let mut build = empty();
+        feed(&mut build, &artifact(OURS, "f_a"));
+        assert!(build.compiled("f_a"));
+        // Not merely "produced no errors": a target cargo never reached also
+        // produces none.
+        assert!(!build.compiled("f_b"));
+    }
+
+    /// Target names are not a namespace. A declared dependency is free to be
+    /// called the same thing as a generated bin, and its artifact must not stand
+    /// as proof that the fixture compiled -- that would pass a `pass` fixture
+    /// that never built, and report a `compile_fail` fixture as compiling.
+    #[test]
+    fn another_packages_artifact_is_not_evidence_about_a_fixture() {
+        let mut build = empty();
+        feed(&mut build, &artifact("/elsewhere/Cargo.toml", "f_a"));
+        assert!(!build.compiled("f_a"));
+    }
+
+    /// Cargo forwards anything a proc macro prints to stdout into this stream.
+    #[test]
+    fn a_forged_artifact_without_our_manifest_is_ignored() {
+        let mut build = empty();
+        feed(
+            &mut build,
+            r#"{"reason":"compiler-artifact","target":{"name":"f_a"}}"#,
+        );
+        assert!(!build.compiled("f_a"));
+    }
+
+    #[test]
+    fn another_packages_diagnostic_does_not_reach_a_fixture() {
+        let mut build = empty();
+        feed(
+            &mut build,
+            &message("/elsewhere/Cargo.toml", "helper", "error", "error: dep\n"),
+        );
+        assert_eq!(build.diagnostics("helper"), "");
+    }
+
+    /// A dependency that will not build leaves every fixture with nothing. Its
+    /// errors are the only description of what actually happened.
+    #[test]
+    fn a_dependency_failure_is_reported_rather_than_discarded() {
+        let mut build = empty();
+        feed(
+            &mut build,
+            &message("/elsewhere/Cargo.toml", "helper", "error", "error: dep\n"),
+        );
+        assert_eq!(build.nothing_built().as_deref(), Some("error: dep"));
+    }
+
+    #[test]
+    fn nothing_built_stays_quiet_when_something_was() {
+        let mut build = empty();
+        feed(
+            &mut build,
+            &message("/elsewhere/Cargo.toml", "helper", "error", "error: dep\n"),
+        );
+        feed(&mut build, &message(OURS, "f_a", "error", "error: mine\n"));
+        assert_eq!(build.nothing_built(), None);
+
+        let mut build = empty();
+        feed(&mut build, &artifact(OURS, "f_a"));
+        assert_eq!(build.nothing_built(), None);
+    }
+
+    #[test]
+    fn build_finished_is_what_says_cargo_got_that_far() {
+        let mut build = empty();
+        assert!(!build.started);
+        feed(&mut build, r#"{"reason":"build-finished","success":false}"#);
+        assert!(build.started);
+    }
+
+    #[test]
+    fn unknown_reasons_are_ignored() {
+        let mut build = empty();
+        feed(&mut build, r#"{"reason":"build-script-executed"}"#);
+        feed(&mut build, r#"{"no-reason-at-all":1}"#);
+        assert!(build.messages.is_empty() && build.compiled.is_empty());
+    }
 }

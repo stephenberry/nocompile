@@ -208,7 +208,7 @@ t.edition("2021");
 
 ## Concurrency
 
-Every fixture in a run is written to the same scratch `src/main.rs`, so a run holds an exclusive lock on its scratch project and concurrent runs serialize. Two `#[test]` functions each calling `nocompile::cases!()` is safe, as is `cargo nextest` or two `cargo test` invocations at once. Without the lock they would compile each other's fixtures and report a broken fixture as passing.
+Every fixture in a run is written into the same scratch project, so a run holds an exclusive lock on it and concurrent runs serialize. Two `#[test]` functions each calling `nocompile::cases!()` is safe, as is `cargo nextest` or two `cargo test` invocations at once. Without the lock they would compile each other's fixtures and report a broken fixture as passing.
 
 ## How it works
 
@@ -228,7 +228,8 @@ Normalization is a short, fixed list of substitutions and is meant to stay that 
 
 | | |
 |---|---|
-| `src/main.rs` | the fixture's own relative path |
+| the generated `src/bin/<name>.rs` | the fixture's own relative path |
+| the generated crate name | `$CRATE` |
 | the scratch project | `$SCRATCH` |
 | the host manifest directory | `$DIR` |
 | an unpacked registry source directory | `$CARGO_REGISTRY` |
