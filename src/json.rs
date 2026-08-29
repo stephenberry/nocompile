@@ -9,10 +9,8 @@
 //! So this is a complete parser for the grammar, and no more than that. It
 //! builds a small tree rather than streaming, because `absorb` reads `reason`
 //! before deciding which other fields it wants and cargo does not promise field
-//! order. Values that no lookup can reach -- numbers, booleans, arrays -- are
-//! checked against the grammar and then discarded rather than materialized: they
-//! still have to parse, because a parser that skipped a construct would be a
-//! parser that accepts malformed input, but nothing can read one.
+//! order. What no lookup can reach is checked against the grammar and then
+//! discarded rather than materialized; see [`Parser::skip_value`].
 
 use std::fmt::{self, Display, Formatter};
 
@@ -129,8 +127,33 @@ impl<'a> Parser<'a> {
     fn value(&mut self) -> Result<Value, Error> {
         match self.peek() {
             Some(b'{') => self.nested(Parser::object),
-            Some(b'[') => self.nested(Parser::array),
-            Some(b'"') => Ok(Value::String(self.string()?)),
+            Some(b'[') => self.nested(Parser::skip_array).map(|()| Value::Other),
+            Some(b'"') => self.string().map(Value::String),
+            Some(b't') => self.literal("true").map(|()| Value::Other),
+            Some(b'f') => self.literal("false").map(|()| Value::Other),
+            Some(b'n') => self.literal("null").map(|()| Value::Other),
+            Some(b'-' | b'0'..=b'9') => self.number().map(|()| Value::Other),
+            Some(_) => Err(self.error("expected a value")),
+            None => Err(self.error("unexpected end of input")),
+        }
+    }
+
+    /// Consume one value, checking it against the grammar and keeping none of it.
+    ///
+    /// Everything inside an array comes through here. No lookup descends into
+    /// one, so building the objects and strings it holds would allocate a tree
+    /// for the sole purpose of dropping it -- and in a `compiler-message` the
+    /// arrays (`spans`, `children`, `target.kind`) are most of the line. It still
+    /// has to parse: a parser that waved a construct through would be a parser
+    /// that accepts malformed input.
+    ///
+    /// This accepts exactly what [`Parser::value`] accepts, and
+    /// `a_value_inside_an_array_is_held_to_the_same_grammar` holds it to that.
+    fn skip_value(&mut self) -> Result<(), Error> {
+        match self.peek() {
+            Some(b'{') => self.nested(Parser::skip_object),
+            Some(b'[') => self.nested(Parser::skip_array),
+            Some(b'"') => self.scan_string(None),
             Some(b't') => self.literal("true"),
             Some(b'f') => self.literal("false"),
             Some(b'n') => self.literal("null"),
@@ -141,10 +164,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Run a container parser one level deeper, refusing to recurse forever.
-    fn nested(
-        &mut self,
-        parse: fn(&mut Parser<'a>) -> Result<Value, Error>,
-    ) -> Result<Value, Error> {
+    fn nested<T>(&mut self, parse: fn(&mut Parser<'a>) -> Result<T, Error>) -> Result<T, Error> {
         if self.depth >= MAX_DEPTH {
             return Err(self.error("nested too deeply"));
         }
@@ -154,10 +174,10 @@ impl<'a> Parser<'a> {
         value
     }
 
-    fn literal(&mut self, word: &str) -> Result<Value, Error> {
+    fn literal(&mut self, word: &str) -> Result<(), Error> {
         if self.bytes[self.at..].starts_with(word.as_bytes()) {
             self.at += word.len();
-            return Ok(Value::Other);
+            return Ok(());
         }
         Err(self.error(&format!("expected `{word}`")))
     }
@@ -191,35 +211,77 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn array(&mut self) -> Result<Value, Error> {
+    /// The same walk as [`Parser::object`], keeping nothing. Deliberately a
+    /// second loop rather than a flag threaded through the first: the two differ
+    /// only in what they retain, and the version that retains nothing reads as
+    /// what it is.
+    fn skip_object(&mut self) -> Result<(), Error> {
+        self.expect(b'{')?;
+
+        self.skip_whitespace();
+        if self.peek() == Some(b'}') {
+            self.at += 1;
+            return Ok(());
+        }
+
+        loop {
+            self.skip_whitespace();
+            self.scan_string(None)?;
+            self.skip_whitespace();
+            self.expect(b':')?;
+            self.skip_whitespace();
+            self.skip_value()?;
+            self.skip_whitespace();
+            match self.peek() {
+                Some(b',') => self.at += 1,
+                Some(b'}') => {
+                    self.at += 1;
+                    return Ok(());
+                }
+                _ => return Err(self.error("expected `,` or `}`")),
+            }
+        }
+    }
+
+    fn skip_array(&mut self) -> Result<(), Error> {
         self.expect(b'[')?;
 
         self.skip_whitespace();
         if self.peek() == Some(b']') {
             self.at += 1;
-            return Ok(Value::Other);
+            return Ok(());
         }
 
         loop {
             self.skip_whitespace();
-            // Parsed for its syntax and dropped: no lookup descends into an
-            // array, so keeping the items would only be to throw them away.
-            self.value()?;
+            self.skip_value()?;
             self.skip_whitespace();
             match self.peek() {
                 Some(b',') => self.at += 1,
                 Some(b']') => {
                     self.at += 1;
-                    return Ok(Value::Other);
+                    return Ok(());
                 }
                 _ => return Err(self.error("expected `,` or `]`")),
             }
         }
     }
 
+    /// A string something will read: an object key, or a value a lookup can
+    /// reach.
     fn string(&mut self) -> Result<String, Error> {
-        self.expect(b'"')?;
         let mut out = String::new();
+        self.scan_string(Some(&mut out))?;
+        Ok(out)
+    }
+
+    /// Walk a string, building it into `out` when there is one.
+    ///
+    /// `None` for a string nothing will read, which still has to be walked to
+    /// find where it ends and to prove it well formed. One scanner serves both,
+    /// so the two cannot come to disagree about which escapes are legal.
+    fn scan_string(&mut self, mut out: Option<&mut String>) -> Result<(), Error> {
+        self.expect(b'"')?;
 
         loop {
             let byte = self
@@ -228,11 +290,11 @@ impl<'a> Parser<'a> {
             match byte {
                 b'"' => {
                     self.at += 1;
-                    return Ok(out);
+                    return Ok(());
                 }
                 b'\\' => {
                     self.at += 1;
-                    self.escape(&mut out)?;
+                    self.escape(out.as_deref_mut())?;
                 }
                 // A control character must be escaped to be legal here.
                 0x00..=0x1F => return Err(self.error("unescaped control character in string")),
@@ -243,12 +305,22 @@ impl<'a> Parser<'a> {
                     // it in one go avoids decoding lengths by hand -- and this
                     // is the bulk of the work, since `rendered` is by far the
                     // largest field in a message.
+                    //
+                    // The input arrived as a `&str` and the run ends on a
+                    // character boundary, so `from_utf8` cannot fail. It is
+                    // checked rather than assumed because the two facts it rests
+                    // on are one edit apart: admitting a continuation byte to
+                    // the stop set below would end a run mid-character.
                     let start = self.at;
                     while !matches!(self.peek(), None | Some(b'"' | b'\\' | 0x00..=0x1F)) {
                         self.at += 1;
                     }
                     match std::str::from_utf8(&self.bytes[start..self.at]) {
-                        Ok(text) => out.push_str(text),
+                        Ok(text) => {
+                            if let Some(out) = out.as_deref_mut() {
+                                out.push_str(text);
+                            }
+                        }
                         Err(_) => return Err(self.error("invalid UTF-8 in string")),
                     }
                 }
@@ -257,7 +329,7 @@ impl<'a> Parser<'a> {
     }
 
     /// The character after a `\`, already consumed.
-    fn escape(&mut self, out: &mut String) -> Result<(), Error> {
+    fn escape(&mut self, out: Option<&mut String>) -> Result<(), Error> {
         let byte = self
             .peek()
             .ok_or_else(|| self.error("unterminated escape"))?;
@@ -274,12 +346,14 @@ impl<'a> Parser<'a> {
             b'u' => return self.unicode_escape(out),
             _ => return Err(self.error("unknown escape")),
         };
-        out.push(ch);
+        if let Some(out) = out {
+            out.push(ch);
+        }
         Ok(())
     }
 
     /// A `\uXXXX` escape, joining a surrogate pair when it finds one.
-    fn unicode_escape(&mut self, out: &mut String) -> Result<(), Error> {
+    fn unicode_escape(&mut self, out: Option<&mut String>) -> Result<(), Error> {
         let first = self.hex4()?;
 
         // A high surrogate is only half a character; the low half follows as a
@@ -302,7 +376,9 @@ impl<'a> Parser<'a> {
                 .ok_or_else(|| self.error("escape is not a character"))?
         };
 
-        out.push(ch);
+        if let Some(out) = out {
+            out.push(ch);
+        }
         Ok(())
     }
 
@@ -325,7 +401,7 @@ impl<'a> Parser<'a> {
         Ok(value)
     }
 
-    fn number(&mut self) -> Result<Value, Error> {
+    fn number(&mut self) -> Result<(), Error> {
         if self.peek() == Some(b'-') {
             self.at += 1;
         }
@@ -354,7 +430,7 @@ impl<'a> Parser<'a> {
             self.digits();
         }
 
-        Ok(Value::Other)
+        Ok(())
     }
 
     fn digits(&mut self) {
@@ -427,6 +503,41 @@ mod tests {
         assert_eq!(s("\"identifiér ↦ ✓\"").as_str(), Some("identifiér ↦ ✓"));
     }
 
+    /// The bulk-copy run stops at the first byte that needs handling, and all of
+    /// those are ASCII -- so it ends on a character boundary and its `from_utf8`
+    /// always succeeds. These pin that, because the two facts it rests on are one
+    /// edit apart: admitting a UTF-8 continuation byte to the stop set would end
+    /// a run mid-character and turn valid text into `invalid UTF-8 in string`.
+    /// rustc's rendered diagnostics put an escape straight after a multi-byte
+    /// character constantly -- box-drawing art, curly quotes, non-ASCII
+    /// identifiers -- so this is the arrangement that would break first.
+    #[test]
+    fn a_multi_byte_character_may_end_a_copied_run() {
+        assert_eq!(s(r#""→\n←""#).as_str(), Some("→\n←"));
+        // Through the key path as well as the value path.
+        assert_eq!(s(r#"{"clé":"✓"}"#).path_str(&["clé"]), Some("✓"));
+    }
+
+    /// The one place the cursor lands mid-character: `escape` steps over the
+    /// byte after a `\` before deciding it is not an escape at all. Nothing
+    /// slices on `at` -- every slice in this module is on `bytes`, which is
+    /// `[u8]` -- so what this pins is that the offset reaches the error message
+    /// rather than the parser mistaking a continuation byte for an escape.
+    #[test]
+    fn a_multi_byte_character_after_a_backslash_is_an_error() {
+        let error = parse("\"\\é\"").expect_err("not an escape");
+        assert!(error.to_string().contains("unknown escape"), "{error}");
+    }
+
+    /// A NUL is a control character: legal escaped, illegal raw. Worth pinning
+    /// because it is the boundary of the `0x00..=0x1F` range and the one value
+    /// an off-by-one there would let through.
+    #[test]
+    fn accepts_an_escaped_nul_and_rejects_a_raw_one() {
+        assert_eq!(s(r#""a\u0000b""#).as_str(), Some("a\0b"));
+        assert!(parse("\"a\u{0}b\"").is_err());
+    }
+
     #[test]
     fn parses_a_basic_multilingual_plane_escape() {
         assert_eq!(s(r#""\u00e9\u2192""#).as_str(), Some("é→"));
@@ -436,7 +547,12 @@ mod tests {
     /// exactly, so the field *after* it is still found.
     #[test]
     fn skipped_values_are_consumed_exactly() {
-        let value = s(r#"{"skip":[1,-2.5,1e3,true,false,null,{},[[[]]]],"want":"here"}"#);
+        // The objects and strings inside the array matter: they are the shape
+        // `spans` and `children` have, and the one the skipping parser walks
+        // without building.
+        let value = s(
+            r#"{"skip":[1,-2.5,1e3,true,false,null,{},{"k":"v \" é","n":[[[]]]}],"want":"here"}"#,
+        );
         assert_eq!(value.path_str(&["want"]), Some("here"));
         assert_eq!(value.get("skip"), Some(&Value::Other));
     }
@@ -455,12 +571,19 @@ mod tests {
     }
 
     /// `value` recurses, and a stack overflow aborts the process rather than
-    /// raising an error a test harness could report.
+    /// raising an error a test harness could report. Objects recurse down a
+    /// separate path from arrays, and both are bounded.
     #[test]
     fn refuses_input_nested_past_the_limit() {
-        let deep = format!("{}{}", "[".repeat(5000), "]".repeat(5000));
-        let error = parse(&deep).expect_err("should refuse");
-        assert!(error.to_string().contains("nested too deeply"), "{error}");
+        for deep in [
+            format!("{}{}", "[".repeat(5000), "]".repeat(5000)),
+            format!("{}1{}", "{\"a\":".repeat(5000), "}".repeat(5000)),
+            // Inside an array, where the skipping parser does the recursing.
+            format!("[{}1{}]", "{\"a\":".repeat(5000), "}".repeat(5000)),
+        ] {
+            let error = parse(&deep).expect_err("should refuse");
+            assert!(error.to_string().contains("nested too deeply"), "{error}");
+        }
     }
 
     #[test]
@@ -469,39 +592,93 @@ mod tests {
         assert!(parse(&ok).is_ok());
     }
 
+    /// Text that is not a JSON value. Kept as a list because the grammar is
+    /// implemented twice -- once building a tree, once discarding one -- and
+    /// both are held to it.
+    const NOT_A_VALUE: &[&str] = &[
+        "{",
+        "[",
+        "{\"a\"}",
+        "{\"a\":}",
+        "{\"a\":1,}",
+        "{\"a\":1 \"b\":2}",
+        "{a:1}",
+        "[1,]",
+        "[1 2]",
+        "\"unterminated",
+        "\"\\q\"",
+        "\"\\u12\"",
+        "\"\\uZZZZ\"",
+        "\"\\\"",
+        "tru",
+        "nulll",
+        "01",
+        "1.",
+        "1e",
+        "-",
+        ".5",
+        "\"\u{1}\"",
+        // A high surrogate with no low one, a high surrogate followed by
+        // something that is not a low one, and a low surrogate on its own.
+        "\"\\uD83E\"",
+        "\"\\uD83E\\u0041\"",
+        "\"\\uDD80\"",
+    ];
+
+    /// Text that is one JSON value, exactly. The counterpart to
+    /// [`NOT_A_VALUE`]: a skipping parser that rejected what the building one
+    /// accepts would be just as wrong.
+    const A_VALUE: &[&str] = &[
+        "1",
+        "-2.5",
+        "1e3",
+        "-0.5E+10",
+        "true",
+        "false",
+        "null",
+        "{}",
+        "[]",
+        "\"\"",
+        "\"x\"",
+        "\"\\uD83E\\uDD80\"",
+        "\"é→ \\n \\\" \\\\\"",
+        "{\"a\":[{\"b\":[\"c\",{}]}],\"d\":null}",
+    ];
+
     /// Malformed input has to be loud. A parser that guessed would put the
     /// guess into a golden.
     #[test]
     fn rejects_malformed_input() {
-        for bad in [
-            "",
-            "{",
-            "[",
-            "{\"a\"}",
-            "{\"a\":}",
-            "{\"a\":1,}",
-            "[1,]",
-            "\"unterminated",
-            "\"\\q\"",
-            "\"\\u12\"",
-            "\"\\uZZZZ\"",
-            "tru",
-            "01",
-            "1.",
-            "1e",
-            "-",
-            ".5",
-            "{} trailing",
-            "\"\u{1}\"",
-        ] {
+        for bad in NOT_A_VALUE {
             assert!(parse(bad).is_err(), "should have rejected {bad:?}");
         }
+        assert!(parse("").is_err(), "empty input is not a value");
+        assert!(parse("{} trailing").is_err(), "trailing content");
     }
 
     #[test]
-    fn rejects_a_lone_surrogate() {
-        assert!(parse(r#""\uD83E""#).is_err());
-        assert!(parse(r#""\uD83E\u0041""#).is_err());
+    fn accepts_every_shape_of_value() {
+        for text in A_VALUE {
+            assert!(parse(text).is_ok(), "should have accepted {text:?}");
+        }
+    }
+
+    /// [`Parser::skip_value`] is a second implementation of the same grammar,
+    /// reached for everything inside an array. Were it ever to drift, malformed
+    /// input would be accepted or good input refused depending only on how
+    /// deeply it happened to be nested -- so the two are held to one list.
+    ///
+    /// The empty input is left out: wrapped, it is `[]`, which is a value.
+    #[test]
+    fn a_value_inside_an_array_is_held_to_the_same_grammar() {
+        for bad in NOT_A_VALUE {
+            let wrapped = format!("[{bad}]");
+            assert!(parse(&wrapped).is_err(), "should have rejected {wrapped:?}");
+        }
+        for text in A_VALUE {
+            let wrapped = format!("[{text}]");
+            assert!(parse(&wrapped).is_ok(), "should have accepted {wrapped:?}");
+        }
     }
 
     #[test]
@@ -512,8 +689,8 @@ mod tests {
 
     #[test]
     fn duplicate_keys_keep_the_first() {
-        // Cargo never emits one; fixing the behaviour keeps it from being a
-        // surprise if it ever does.
+        // RFC 8259 leaves this undefined and cargo never emits one; fixing the
+        // behaviour keeps it from being a surprise if it ever does.
         assert_eq!(
             s(r#"{"a":"first","a":"second"}"#).path_str(&["a"]),
             Some("first")

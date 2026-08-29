@@ -889,7 +889,6 @@ fn adding_a_fixture_does_not_disturb_another_fixtures_golden() {
     );
 }
 
-
 /// Cargo suppresses a diagnostic whose message begins with `aborting due to`,
 /// or ends with `warning emitted` / `warnings emitted`, on its way to reporting
 /// its own summary. A `compile_error!` worded that way is suppressed with it,
@@ -964,7 +963,12 @@ fn a_suppressed_wording_is_reported_the_same_way_beside_a_healthy_fixture() {
         outcome.report()
     );
     let failures: Vec<_> = outcome.failures().collect();
-    assert_eq!(failures.len(), 1, "expected one failure:\n{}", outcome.report());
+    assert_eq!(
+        failures.len(),
+        1,
+        "expected one failure:\n{}",
+        outcome.report()
+    );
     assert_eq!(failures[0].path(), Path::new("ui/suppressed.rs"));
     assert!(matches!(
         failures[0].failure(),
@@ -977,4 +981,3 @@ fn a_suppressed_wording_is_reported_the_same_way_beside_a_healthy_fixture() {
         "a healthy fixture beside a suppressed one was not blessed"
     );
 }
-
