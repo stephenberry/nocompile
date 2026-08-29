@@ -83,7 +83,7 @@ help: provide the argument
   |                ++++++++++
 ```
 
-What it drops is entirely rustc-rendering detail — source snippets, underline art, and the `= note:` lines that a rustc release reflows. What it keeps is every error code, every primary message and every span, so it still catches every regression that matters: a fixture that stops failing, or one that starts failing for a _different_ reason. On one real 19-fixture suite it takes 436 golden lines down to 78.
+What it drops is entirely rustc-rendering detail — source snippets, underline art, and the `= note:` lines that a rustc release reflows. What it keeps is every error code, every primary message and every span, so it still catches every regression that matters: a fixture that stops failing, or one that starts failing for a _different_ reason. On this crate's own UI suite it takes 33 golden lines down to 7; the single diagnostic above goes from 15 lines to 3. Re-bless your own suite both ways to see the ratio you would get.
 
 The filter is applied to both sides of the comparison, so an existing `Exact` golden passes in `Brief` mode unchanged. Switching is a one-line change; blessing afterwards shrinks the goldens to match.
 
@@ -117,11 +117,12 @@ A crate whose selling point is "no dependencies" cannot have dev-dependencies ei
 Use `nocompile` if you keep a deliberately small dependency surface and currently pay a large one for a handful of compile-fail fixtures: `no_std`-adjacent crates, cryptography and safety-critical libraries, anything audited, anything embedded, anything whose pitch is its dependency tree. In one real workspace, `trybuild` was the only root of fifteen lock entries:
 
 ```
-glob  serde  serde_core  serde_derive  serde_json  itoa  memchr  zmij
-target-triple  termcolor  toml  serde_spanned  toml_datetime  toml_parser  winnow
+dissimilar  glob  serde  serde_derive  serde_json  target-triple  termcolor  toml
 ```
 
-That set is workspace-dependent — if you already depend on `serde` or `toml`, removing `trybuild` removes correspondingly fewer. Check your own with `cargo tree -i -p <crate>`.
+Those are `trybuild`'s direct dependencies, from its published manifest; the transitive set is larger and pulls in a serialization stack and a TOML parser.
+
+How much of it actually leaves your lockfile is workspace-dependent — if you already depend on `serde` or `toml`, removing `trybuild` removes correspondingly fewer. Check your own with `cargo tree -i -p <crate>` before and after.
 
 And be honest about the size of the win: `trybuild` is a dev-dependency. It never ships and never enters a release binary. It costs lock entries, some test-build time, and an explanation when an audit asks why a compile-fail harness needs a serialization framework. If you do not track your dependency count, use `trybuild`.
 
@@ -147,7 +148,7 @@ The moment a suite grows past what the host toolchain can express, `trybuild` is
 
 One fixture is one `cargo build`, so cargo's startup and fingerprint scan are paid once per fixture. `trybuild` builds all fixtures in a single invocation and demultiplexes the diagnostics back to each one — which it can do because it is already parsing `--message-format=json`, where every diagnostic carries the file it belongs to. Plain stderr has no such delimiter, so batching here would mean guessing which fixture each interleaved block came from. That is the direct cost of the zero-dependency design, not an oversight, and it will not be fixed without taking the JSON dependency back.
 
-In practice this is roughly 100 ms per fixture and it scales linearly, so a 17-fixture suite spends about a second where `trybuild` spends half of one. Fine at that size; worth knowing before pointing it at a suite of hundreds.
+Measured on this crate's own suite, that is under 100 ms per fixture against a warm cache, and it scales linearly. Fine for a suite of tens; worth knowing before pointing it at a suite of hundreds, where batching would start to matter more than the dependency count does.
 
 ## Declared dependencies, not inferred ones
 
