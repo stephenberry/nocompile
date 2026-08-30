@@ -17,8 +17,9 @@ use std::fmt::{self, Display, Formatter};
 pub enum Mode {
     /// Byte-for-byte after normalization. Maximum information, maximum churn.
     ///
-    /// The default, because it is what `trybuild` does -- so a migrating golden
-    /// matches unedited -- and because its failure mode is the loud one. An
+    /// The default, because it is the closest thing to what `trybuild` does --
+    /// so a migrating golden is usually a small diff rather than a rewrite --
+    /// and because its failure mode is the loud one. An
     /// `Exact` suite that needs re-blessing after a toolchain upgrade says so;
     /// a suite that quietly asserts less than you think does not.
     ///
