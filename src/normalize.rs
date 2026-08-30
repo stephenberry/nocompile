@@ -1,9 +1,10 @@
-//! Making diagnostics machine-independent.
+//! Making a diagnostic reproducible: the same text on any machine, and the same
+//! text tomorrow unless what the fixture asserts has changed.
 //!
 //! Every substitution here is a thing a golden can no longer distinguish, so the
-//! fixed list is deliberately short and deliberately closed. Five placeholders
-//! is a design; fifteen is a symptom that the goldens are recording things they
-//! should not.
+//! fixed list is deliberately short and deliberately closed. A handful of
+//! placeholders is a design; fifty is a symptom that the goldens are recording
+//! things they should not.
 //!
 //! The one open-ended part is intentional: a declared path dependency can get a
 //! placeholder of its own, because a diagnostic is free to point into a
@@ -29,6 +30,21 @@
 //! that width behind. The gutter is re-aligned to the widest number that
 //! survives, so what a golden records is the fixture's line numbers and nothing
 //! else's.
+//!
+//! # Implementor lists
+//!
+//! The same argument one step further out. Where rustc prints a count of the
+//! implementors of a trait it chose not to list, that count becomes `$N`,
+//! wherever the line appears. It is a fact about the crate graph rather than
+//! about the fixture: adding a single impl anywhere moves the number in every golden whose
+//! diagnostic reaches that trait, including all the goldens testing something
+//! else. A golden that has to be re-blessed for a reason it does not assert is
+//! the failure this module exists to prevent.
+//!
+//! A list long enough that rustc might elide it is truncated to the length
+//! rustc's own elision produces, for the same reason: where rustc draws that
+//! line has moved between releases, and a golden should not record which side of
+//! it the current toolchain sits on.
 
 use crate::scratch::Dependency;
 use std::env;
@@ -46,6 +62,8 @@ pub(crate) const CARGO_HOME: &str = "$CARGO_HOME";
 pub(crate) const RUST: &str = "$RUST";
 /// Placeholder for the generated crate a fixture is compiled as.
 pub(crate) const CRATE: &str = "$CRATE";
+/// Placeholder for the count of implementors rustc chose not to list.
+pub(crate) const OTHERS: &str = "$N";
 
 /// The path rewrites for one fixture.
 ///
@@ -126,6 +144,7 @@ impl Normalizer {
             }
 
             line = self.rewrite_paths(&line, fixture);
+            hide_other_count(&mut line);
 
             // Done after rewriting, so the comparison is against the fixture's
             // normalized path rather than the scratch project's.
@@ -138,6 +157,10 @@ impl Normalizer {
 
             lines.push(line);
         }
+
+        // Before the gutters are re-aligned, so that the alignment sees the
+        // lines the golden will actually hold.
+        truncate_implementor_lists(&mut lines);
 
         // Last, because it is the blanking above that frees the width it
         // reclaims.
@@ -332,6 +355,122 @@ fn is_snippet_row(line: &str) -> bool {
         line.trim_start().chars().next(),
         Some('0'..='9' | '|' | '.')
     )
+}
+
+/// The `= help:` headings whose indented lines are a list of trait implementors.
+const IMPLEMENTOR_HEADINGS: [&str; 2] = [
+    "= help: the following types implement trait ",
+    "= help: the following other types implement trait ",
+];
+
+/// What rustc prints in place of a list's tail, once the count is `$N`.
+const SUMMARY: &str = "and $N others";
+
+/// The column at or past which a line under one of those headings is an entry.
+///
+/// rustc indents an entry ten columns past the `= help:` above it, and that
+/// `= help:` sits one column past a gutter at least one wide, so twelve is the
+/// narrowest an entry can be. `trybuild` draws the line in the same place, and
+/// moving it would make a golden blessed by one harness fail under the other --
+/// the outcome this whole rule exists to prevent.
+const ENTRY_COLUMN: usize = 12;
+
+/// The entry position that becomes the summary rather than an entry.
+///
+/// `trybuild`'s threshold, and so this one: a list of ten or more keeps its
+/// first eight entries and summarizes the rest.
+const SUMMARIZED_AT: usize = 9;
+
+/// `and 568 others` -> `and $N others`.
+///
+/// The count is how many implementors of a trait rustc chose not to name. It
+/// answers a question about the crate graph, not about the fixture, so a golden
+/// that records it is re-blessed by any impl added anywhere -- including in the
+/// goldens that have nothing to do with the trait in question.
+fn hide_other_count(line: &mut String) {
+    let trimmed = line.trim_start();
+    if !trimmed.starts_with("and ") || !trimmed.ends_with(" others") {
+        return;
+    }
+    let start = line.len() - trimmed.len() + "and ".len();
+    let end = line.len() - " others".len();
+    // Both halves matter. An empty range satisfies `all` vacuously, so
+    // `and  others` would otherwise gain a `$N` standing for a number rustc
+    // never printed; `and others` arrives with `start` past `end`.
+    if start < end && line[start..end].bytes().all(|b| b.is_ascii_digit()) {
+        line.replace_range(start..end, OTHERS);
+    }
+}
+
+/// Summarize the tail of an implementor list that rustc printed in full.
+///
+/// rustc elides this list itself once it grows past some length, but where that
+/// length falls has moved between releases, so a golden blessed today records
+/// which side of the current threshold the list sits on. Truncating to the shape
+/// rustc's own elision produces takes that back out: a list that crosses the
+/// threshold in either direction, in either harness, reads the same afterwards.
+///
+/// The list ends at the first line that is not indented far enough to be an
+/// entry, which is how rustc separates it from the `note:` or span that follows.
+fn truncate_implementor_lists(lines: &mut Vec<String>) {
+    // Entries seen in the list currently open, or `None` between lists.
+    let mut listed: Option<usize> = None;
+    // Where the next surviving line goes.
+    let mut kept = 0;
+
+    for index in 0..lines.len() {
+        let trimmed = lines[index].trim_start();
+        let column = lines[index].len() - trimmed.len();
+
+        if IMPLEMENTOR_HEADINGS
+            .iter()
+            .any(|heading| trimmed.starts_with(heading))
+        {
+            listed = Some(0);
+        } else if let Some(seen) = &mut listed {
+            // A summary rustc wrote itself closes the list as surely as an
+            // outdented line does, and is kept as the summary this rule would
+            // otherwise have had to write.
+            if column < ENTRY_COLUMN || trimmed == SUMMARY {
+                listed = None;
+            } else {
+                *seen += 1;
+                if *seen > SUMMARIZED_AT {
+                    continue;
+                }
+                // Only a list that runs past this entry has a tail worth
+                // summarizing. One that stops here is short enough to keep
+                // whole, and saying `and $N others` about nothing would be a
+                // lie the golden then asserts.
+                if *seen == SUMMARIZED_AT && continues_past(lines, index, column) {
+                    // Two columns in from the entries, where rustc puts a
+                    // summary: it reads as prose about the list rather than as
+                    // another entry in it.
+                    lines[index].replace_range(column - 2.., SUMMARY);
+                }
+            }
+        }
+
+        lines.swap(kept, index);
+        kept += 1;
+    }
+
+    lines.truncate(kept);
+}
+
+/// Whether the list still has entries after `index`, which is what makes the one
+/// there a summary rather than the last of a list short enough to keep whole.
+///
+/// The next line has to sit at *exactly* this column, as `trybuild` compares it:
+/// a list whose last entry is indented differently keeps all nine and gets no
+/// summary, in either harness. The comparison is against the line as this module
+/// has already trimmed it, where `trybuild` looks at the raw one; the two differ
+/// only for a whitespace-only line at the entry column, which rustc does not
+/// print and a trimmed golden cannot hold.
+fn continues_past(lines: &[String], index: usize, column: usize) -> bool {
+    lines
+        .get(index + 1)
+        .is_some_and(|next| next.len() - next.trim_start().len() == column)
 }
 
 /// Re-align each diagnostic's gutter to the widest line number left in it.
@@ -1501,5 +1640,136 @@ mod tests {
         // `tests/ui/a.rs` must not claim `tests/ui/a.rs.bak`.
         let out = normalizer().normalize(" --> /w/tests/ui/a.rs.bak:1:1\n", "tests/ui/a.rs");
         assert_eq!(out, " --> $DIR/tests/ui/a.rs.bak\n");
+    }
+
+    /// One entry per line, indented as rustc indents them under a `= help:`.
+    fn implementor_list(entries: &[&str]) -> String {
+        let mut text = String::from(
+            "error[E0277]: the trait bound `T: Pod` is not satisfied\n  \
+             --> tests/ui/a.rs:22:5\n   |\n22 |     f::<T>();\n   |     ^ nope\n   |\n   \
+             = help: the following other types implement trait `Pod`:\n",
+        );
+        for entry in entries {
+            text.push_str("             ");
+            text.push_str(entry);
+            text.push('\n');
+        }
+        text.push_str("note: required by a bound in `f`\n");
+        text
+    }
+
+    fn entries(count: usize) -> Vec<String> {
+        (0..count).map(|i| format!("Type{i}")).collect()
+    }
+
+    fn rendered(entries: &[String]) -> String {
+        let borrowed: Vec<&str> = entries.iter().map(String::as_str).collect();
+        normalizer().normalize(&implementor_list(&borrowed), "tests/ui/a.rs")
+    }
+
+    /// The list's own lines, entries and summary alike: the summary sits two
+    /// columns in from an entry, so the shallowest of them is the bound.
+    fn entry_lines(text: &str) -> Vec<String> {
+        text.lines()
+            .filter(|line| line.starts_with(&" ".repeat(ENTRY_COLUMN - 2)))
+            .map(str::trim_start)
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn normalized_list(count: usize) -> Vec<String> {
+        entry_lines(&rendered(&entries(count)))
+    }
+
+    #[test]
+    fn hides_the_count_of_unlisted_implementors() {
+        let out = normalizer().normalize("          and 568 others\n", "tests/ui/a.rs");
+        assert_eq!(out, "          and $N others\n");
+    }
+
+    #[test]
+    fn leaves_an_others_line_without_a_count_alone() {
+        // Neither is a count rustc would print, and rewriting either would put a
+        // `$N` in the golden standing for a number that was never there.
+        let out = normalizer().normalize("and others\nand 12x others\n", "tests/ui/a.rs");
+        assert_eq!(out, "and others\nand 12x others\n");
+    }
+
+    #[test]
+    fn keeps_an_implementor_list_rustc_did_not_elide() {
+        // Nine is the longest list that stays whole: summarizing here would
+        // claim a tail the diagnostic does not have.
+        assert_eq!(normalized_list(9), entries(9));
+    }
+
+    #[test]
+    fn summarizes_an_implementor_list_rustc_printed_in_full() {
+        // Ten entries, so the ninth becomes the summary and the tenth goes.
+        let mut expected = entries(8);
+        expected.push(SUMMARY.to_string());
+        assert_eq!(normalized_list(10), expected);
+        // And a longer one lands in exactly the same place, which is the point:
+        // the golden stops recording where rustc's own threshold falls.
+        assert_eq!(normalized_list(40), expected);
+    }
+
+    #[test]
+    fn summarizes_at_the_column_rustc_uses() {
+        // Two columns in from its entries, so it reads as prose about the list.
+        let out = rendered(&entries(10));
+        assert!(out.contains("\n           and $N others\n"), "{out}");
+    }
+
+    #[test]
+    fn keeps_a_summary_rustc_wrote_itself() {
+        // rustc elided the tail on its own. The list is already the shape this
+        // rule produces, and its summary must not be counted as a tenth entry
+        // and dropped.
+        let mut listed = entries(8);
+        listed.push("and 568 others".to_string());
+        let mut expected = entries(8);
+        expected.push(SUMMARY.to_string());
+        assert_eq!(entry_lines(&rendered(&listed)), expected);
+    }
+
+    #[test]
+    fn summarizes_a_list_under_the_narrowest_gutter_rustc_prints() {
+        // One-digit line numbers put `= help:` at column two and its entries at
+        // twelve, the shallowest either can be. A list indented that far is
+        // still a list, and `ENTRY_COLUMN` has to reach it.
+        let mut text = String::from("  = help: the following types implement trait `Pod`:\n");
+        for i in 0..10 {
+            text.push_str(&format!("            Type{i}\n"));
+        }
+        let out = normalizer().normalize(&text, "tests/ui/a.rs");
+        assert!(
+            out.ends_with("            Type7\n          and $N others\n"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn leaves_a_list_indented_short_of_an_entry_alone() {
+        // One column shallower than rustc can put an entry, so these are not
+        // entries and the list they would have formed is never open.
+        let mut text = String::from("  = help: the following types implement trait `Pod`:\n");
+        for i in 0..10 {
+            text.push_str(&format!("{}Type{i}\n", " ".repeat(ENTRY_COLUMN - 1)));
+        }
+        let out = normalizer().normalize(&text, "tests/ui/a.rs");
+        assert_eq!(out, text);
+    }
+
+    #[test]
+    fn does_not_summarize_lines_outside_an_implementor_list() {
+        // The heading is what opens a list. Ten indented lines under anything
+        // else are ten lines rustc meant, and truncating them would delete part
+        // of the assertion.
+        let mut text = String::from("   = note: the following are not implementors:\n");
+        for i in 0..10 {
+            text.push_str(&format!("             Type{i}\n"));
+        }
+        let out = normalizer().normalize(&text, "tests/ui/a.rs");
+        assert_eq!(out, text);
     }
 }

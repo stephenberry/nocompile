@@ -93,7 +93,7 @@ The filter is applied to both sides of the comparison, so an existing `Exact` go
 
 **Use `Exact` when the rendering is the product** — a `#[diagnostic::on_unimplemented]` message, a `= help:` suggestion you wrote deliberately, a span you placed on purpose. `Brief` drops all three, so it cannot regression-test them.
 
-`Exact` stays the default: it is what `trybuild` produces, so a migrating golden matches unedited, and its failure mode is the loud one. A suite that needs re-blessing after a toolchain upgrade tells you so; a suite quietly asserting less than you think does not.
+`Exact` stays the default: it is the closest thing to what `trybuild` produces, so a migrating golden is usually a small diff rather than a rewrite, and its failure mode is the loud one. A suite that needs re-blessing after a toolchain upgrade tells you so; a suite quietly asserting less than you think does not.
 
 ### Why goldens at all
 
@@ -260,10 +260,11 @@ Normalization is a short, fixed list of substitutions and is meant to stay that 
 | `CARGO_HOME` | `$CARGO_HOME` |
 | the toolchain's own source | `$RUST` |
 | each declared path dependency outside `$DIR` | `$NAME_OF_THE_CRATE` |
+| the count in `and N others` | `$N` |
 
 `$RUST` covers all three shapes a toolchain path takes — a rustup toolchain, whose path carries both your home directory *and* the host triple, the older `src/rust/src` layout, and the `/rustc/<commit>/library` form. Any trait bound involving a std type produces one of these, so without it a golden passes only on the machine that blessed it.
 
-The last row is one rule rather than a growing list of special cases: a diagnostic is free to point into a dependency's source, and that path is absolute and machine-specific. A dependency that sits *inside* the host crate is already covered by `$DIR` and stays there. Names are uppercased with `-` becoming `_`, matching `trybuild`, so a golden that already contains `$MY_CRATE` migrates unedited.
+The path-dependency row is one rule rather than a growing list of special cases: a diagnostic is free to point into a dependency's source, and that path is absolute and machine-specific. A dependency that sits *inside* the host crate is already covered by `$DIR` and stays there. Names are uppercased with `-` becoming `_`, matching `trybuild`, so a golden that already contains `$MY_CRATE` migrates unedited.
 
 Every prefix is anchored on a path component boundary, so a sibling checkout at `../my-crate-helper` is not rewritten to `$MY_CRATE-helper`.
 
@@ -284,6 +285,21 @@ note: required by a bound in `take`
 Those numbers record where a dependency happens to put its code today. Without this, adding a doc comment near the top of a dependency file re-blesses every golden whose diagnostic reaches into it, for a reason that has nothing to do with any invariant under test. `trybuild` does the same thing, for the same reason.
 
 The gutter shrinks with them. rustc sizes it to the widest line number *anywhere* in a diagnostic, children included, so an item at line 508 in a dependency renders the **fixture's own** snippet three columns wide. Blanking the digits alone would leave that width behind, and the dependency's line count would be back in the golden through the side door — moving that item to line 1008 would re-bless every row, including the ones describing the fixture. So the gutter is re-aligned to the widest number that survived. `trybuild` writes the same shape, so a migrating golden still matches.
+
+### Implementor lists
+
+The same argument one step further out. Where a diagnostic lists the types implementing a trait, rustc prints a count of the ones it left out, and that count becomes `$N`:
+
+```
+  = help: the following other types implement trait `Pod`:
+            u8
+            u16
+          and $N others
+```
+
+The number is a fact about the crate graph, not about the fixture. Adding one `Pod` impl anywhere moves it in every golden whose diagnostic reaches that trait — including all the goldens testing something else entirely, which then have to be re-blessed with a diff that has nothing to do with what they assert.
+
+A list long enough that rustc might elide it is truncated to the shape rustc's own elision produces: the first eight entries and `and $N others`. Where rustc draws that line has moved between releases, and a golden should not record which side of it your current toolchain sits on. `trybuild` normalizes both, so a migrating golden matches.
 
 ## Migrating from trybuild
 
