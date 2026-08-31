@@ -10,6 +10,7 @@
 //! error codes alone asserts nothing at all about `compile_error!`, which
 //! carries none. Both turn a green suite into no evidence.
 
+use std::borrow::Cow;
 use std::fmt::{self, Display, Formatter};
 
 /// How a fixture's diagnostics are compared against its golden.
@@ -70,9 +71,35 @@ impl Display for Mode {
 
 /// Reduce `text` to what `mode` compares.
 pub(crate) fn filter(text: &str, mode: Mode) -> String {
+    let text = unify_line_endings(text);
     match mode {
-        Mode::Exact => text.to_string(),
-        Mode::Brief => brief(text),
+        Mode::Exact => text.into_owned(),
+        Mode::Brief => brief(&text),
+    }
+}
+
+/// Rewrite CRLF to LF, so a golden compares the same however git checked it out.
+///
+/// The harness writes a golden with `\n`: `normalize` splits on `str::lines` and
+/// rejoins. But git on Windows checks text files out as CRLF by default, so the
+/// golden read back carries a `\r` on every line that the diagnostics do not.
+/// `Exact` compares byte for byte, so an entire suite mismatches at once.
+///
+/// The failure that produces is the reason this belongs in the harness rather
+/// than in each consumer's `.gitattributes`. `str::lines` drops the `\r`, and the
+/// diff in the report is line-based, so the report states a mismatch and then
+/// renders a diff with nothing in it -- the least actionable thing this crate can
+/// print. `Brief` was immune by accident, because `brief` rebuilds its text from
+/// `str::lines`.
+///
+/// Only the CRLF pair is rewritten, which is exactly the transformation git
+/// applied. A lone `\r` is left alone: it is content rather than a line ending,
+/// and rustc can put one in a diagnostic that quotes a fixture's source.
+fn unify_line_endings(text: &str) -> Cow<'_, str> {
+    if text.contains('\r') {
+        Cow::Owned(text.replace("\r\n", "\n"))
+    } else {
+        Cow::Borrowed(text)
     }
 }
 
@@ -228,5 +255,17 @@ error: MYLIB-E001: expected a struct with named fields
     #[test]
     fn mode_default_is_exact() {
         assert_eq!(Mode::default(), Mode::Exact);
+    }
+
+    /// git on Windows hands back a golden the harness never wrote.
+    #[test]
+    fn crlf_line_endings_are_unified_before_comparison() {
+        assert_eq!(filter("a\r\nb\r\n", Mode::Exact), "a\nb\n");
+    }
+
+    /// A lone `\r` is content, not a line ending, so it survives.
+    #[test]
+    fn a_bare_carriage_return_is_left_alone() {
+        assert_eq!(filter("a\rb\n", Mode::Exact), "a\rb\n");
     }
 }

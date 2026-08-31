@@ -171,6 +171,62 @@ fn a_rejected_fixture_with_a_wrong_golden_fails() {
     );
 }
 
+/// A golden checked out with Windows line endings still matches.
+///
+/// git converts LF to CRLF on checkout by default on Windows, so every golden in
+/// a suite arrives carrying a `\r` the diagnostics do not have. `Exact` compared
+/// byte for byte and failed all of them at once -- and the report showed a diff
+/// with no differences in it, because the diff is line-based. Reproduced here on
+/// any platform by writing the golden back the way git would.
+#[test]
+fn a_golden_checked_out_with_crlf_still_matches() {
+    let sandbox = Sandbox::new("crlf-golden");
+    sandbox.write("ui/rejected.rs", REJECTED);
+
+    let mut t = sandbox.cases();
+    t.compile_fail("ui/rejected.rs");
+    assert_passed(&t.overwrite(true).run());
+
+    let golden = sandbox.read("ui/rejected.stderr");
+    assert!(
+        !golden.contains('\r'),
+        "the harness wrote CRLF itself: {golden:?}"
+    );
+    sandbox.write("ui/rejected.stderr", &golden.replace('\n', "\r\n"));
+
+    assert_passed(&t.overwrite(false).run());
+}
+
+/// A real difference is still caught when the golden arrives as CRLF: the
+/// endings are unified so the comparison can see the content, not so it stops
+/// comparing.
+#[test]
+fn a_crlf_golden_that_is_wrong_still_fails() {
+    let sandbox = Sandbox::new("crlf-golden-wrong");
+    sandbox.write("ui/rejected.rs", REJECTED);
+
+    let mut t = sandbox.cases();
+    t.compile_fail("ui/rejected.rs");
+    assert_passed(&t.overwrite(true).run());
+
+    let corrupted = sandbox
+        .read("ui/rejected.stderr")
+        .replace("mismatched types", "some other problem entirely")
+        .replace('\n', "\r\n");
+    sandbox.write("ui/rejected.stderr", &corrupted);
+
+    let outcome = t.overwrite(false).run();
+    let report = outcome.report();
+    assert!(
+        matches!(sole_failure(&outcome), Failure::Mismatch { .. }),
+        "{report}"
+    );
+    assert!(
+        report.contains("-error[E0308]: some other problem entirely"),
+        "{report}"
+    );
+}
+
 /// A mismatch on a diagnostic that reaches into the standard library says why
 /// it might not be the fixture's fault.
 ///
