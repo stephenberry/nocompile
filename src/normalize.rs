@@ -859,13 +859,6 @@ fn indent(line: &str) -> usize {
     line.bytes().take_while(|b| *b == b' ').count()
 }
 
-/// Rewrite a toolchain source path to [`RUST`].
-///
-/// Three shapes reach a diagnostic: a rustup toolchain, whose path carries both
-/// the user's home directory *and* the host triple; the older `src/rust/src`
-/// layout; and the `/rustc/<commit>/library` form a distributed toolchain
-/// reports. Any trait bound involving a std type produces one, which makes this
-/// the most common way a golden stops being portable.
 /// Replace a *known* sysroot's source directory with `$RUST`.
 ///
 /// Anchored on the path itself rather than on a marker inside it, so the start
@@ -883,6 +876,13 @@ fn replace_sysroot_prefix(line: &str, root: &str) -> String {
     out
 }
 
+/// Rewrite a toolchain source path to [`RUST`].
+///
+/// Three shapes reach a diagnostic: a rustup toolchain, whose path carries both
+/// the user's home directory *and* the host triple; the older `src/rust/src`
+/// layout; and the `/rustc/<commit>/library` form a distributed toolchain
+/// reports. Any trait bound involving a std type produces one, which makes this
+/// the most common way a golden stops being portable.
 fn replace_sysroot(line: &str) -> String {
     const MARKERS: [&str; 2] = [
         "/lib/rustlib/src/rust/library/",
