@@ -45,7 +45,46 @@
 //! rustc's own elision produces, for the same reason: where rustc draws that
 //! line has moved between releases, and a golden should not record which side of
 //! it the current toolchain sits on.
-
+//!
+//! # What `$RUST` does not hide
+//!
+//! The placeholder hides *where* the toolchain's source lives, not *whether* it
+//! is there. A span into the standard library renders its source only where the
+//! `rust-src` component is installed, and without it rustc re-renders each
+//! annotation as a `= note:` and splits one annotated block into one span header
+//! per annotation -- so the two machines differ in their number of span headers,
+//! and no substitution reconciles that. It is an environment requirement rather
+//! than a normalization, and `Failure::Mismatch` says so when a mismatch
+//! involves such a span. Dropping the rows was tried and rejected: it converged
+//! the simplest shape only, and it deleted rustc's own label text, including
+//! notes both machines render identically.
+//!
+//! # Separators
+//!
+//! rustc spells a path with the platform's separator, so the same diagnostic
+//! arrives as `$DIR/src/lib.rs` on Unix and `$DIR\src\lib.rs` on Windows. A
+//! golden holds one of those, so without folding them together a suite blessed
+//! anywhere fails everywhere else -- which is the whole of a golden's value
+//! gone, for a reason no fixture asserts.
+//!
+//! The fold is *anchored*, and that is the interesting part. `\` is a separator
+//! on Windows and an escape everywhere, and nothing in the rendered text tells
+//! the two apart: rewriting every `\` would turn `unknown character escape: \d`
+//! into `\d` spelled with a slash, and a diagnostic about an escape is exactly
+//! the kind a compile-fail harness exists to pin. So a line is folded only
+//! where it holds a path this normalizer already knows -- the scratch project,
+//! the manifest directory, `CARGO_HOME`, a declared dependency -- or a marker
+//! that is a path by construction. Every other line keeps its backslashes.
+//!
+//! The line is the unit, rather than the run of text around the path, because a
+//! path is not delimited by anything: `C:\Users\My Name\w` holds a space, and
+//! a rule that stopped at one would leave the fold silently not firing for every
+//! developer whose home directory has one. What that costs is a line carrying
+//! both a machine-specific path and a real escape, where the escape folds too.
+//! No checked-in fixture can produce one: the rows a golden quotes verbatim are
+//! the fixture's own source, and a fixture cannot contain this machine's
+//! manifest directory or scratch root.
+//!
 use crate::scratch::Dependency;
 use std::env;
 use std::path::Path;
@@ -100,20 +139,23 @@ impl Normalizer {
     ) -> Self {
         let mut dependencies: Vec<(String, String)> = dependencies
             .iter()
-            .map(|dep| (dep.path.display().to_string(), placeholder(&dep.name)))
+            .map(|dep| (fold_separators(&dep.path), placeholder(&dep.name)))
             .collect();
         // Longest path first, so a dependency nested inside another claims its
         // own paths rather than having the outer one rewrite the prefix and
         // leave a half-substituted line behind.
         dependencies.sort_by_key(|(path, _)| std::cmp::Reverse(path.len()));
 
+        // Every needle is stored `/`-separated, because every line it is
+        // matched against has been folded to that form by then. `bin` holds a
+        // target name rather than a path and has no separator to fold.
         Self {
-            scratch_absolute: scratch_absolute.display().to_string(),
+            scratch_absolute: fold_separators(scratch_absolute),
             scratch_relative: crate::scratch::bin_relative(bin),
             bin: bin.to_string(),
-            scratch_root: scratch_root.display().to_string(),
-            manifest_dir: manifest_dir.display().to_string(),
-            cargo_home: cargo_home().map(|home| home.display().to_string()),
+            scratch_root: fold_separators(scratch_root),
+            manifest_dir: fold_separators(manifest_dir),
+            cargo_home: cargo_home().map(|home| fold_separators(&home)),
             dependencies,
         }
     }
@@ -143,6 +185,8 @@ impl Normalizer {
                 }
             }
 
+            // Before the rewrites, which match `/`-separated needles.
+            self.fold_paths(&mut line);
             line = self.rewrite_paths(&line, fixture);
             hide_other_count(&mut line);
 
@@ -225,6 +269,64 @@ impl Normalizer {
         }
         line
     }
+
+    /// Fold Windows separators to `/`, on the lines that hold a path.
+    ///
+    /// Anchored rather than blanket, because `\` is a separator on Windows and
+    /// an escape everywhere: see the module docs. The early return keeps this
+    /// free on the platforms where there is nothing to fold.
+    fn fold_paths(&self, line: &mut String) {
+        if !line.contains('\\') {
+            return;
+        }
+        let folded = line.replace('\\', "/");
+        if self.holds_a_path(&folded) {
+            *line = folded;
+        }
+    }
+
+    /// Whether a folded line holds a path this normalizer is going to rewrite.
+    ///
+    /// The question a fold has to answer before it fires, and the reason it can
+    /// be answered at all: the harness knows which paths it put in the
+    /// diagnostic's way.
+    fn holds_a_path(&self, line: &str) -> bool {
+        // A rustup toolchain sits under neither `CARGO_HOME` nor the manifest
+        // dir, so the sysroot is the one path that has to anchor itself. This
+        // covers both of `replace_sysroot`'s markers, which share it as a prefix.
+        //
+        // `replace_rustc_commit`'s `/rustc/<hash>/` form deliberately gets no
+        // anchor: it is a virtual prefix rustc bakes in, spelled with `/` on
+        // every platform, so it never carries a separator that needs folding.
+        const SYSROOT_MARKER: &str = "/lib/rustlib/src/rust/";
+        if line.contains(SYSROOT_MARKER) {
+            return true;
+        }
+        if line.contains(&self.scratch_relative) {
+            return true;
+        }
+
+        // `scratch_absolute` sits inside `scratch_root`, so the root covers it.
+        // An empty anchor would match every line and fold all of it, and
+        // `CARGO_HOME` set to the empty string is the one way to reach that.
+        [
+            Some(&self.scratch_root),
+            Some(&self.manifest_dir),
+            self.cargo_home.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .chain(self.dependencies.iter().map(|(path, _)| path))
+        .any(|anchor| !anchor.is_empty() && line.contains(anchor.as_str()))
+    }
+}
+
+/// Rewrite a path's separators to `/`.
+///
+/// `Path::display` spells a path the way the platform does, so this is the
+/// identity on Unix and the whole of the difference on Windows.
+fn fold_separators(path: &Path) -> String {
+    path.display().to_string().replace('\\', "/")
 }
 
 /// Replace the directory `from` with `to`, but only where `from` is a whole path
@@ -1770,6 +1872,87 @@ mod tests {
             text.push_str(&format!("             Type{i}\n"));
         }
         let out = normalizer().normalize(&text, "tests/ui/a.rs");
+        assert_eq!(out, text);
+    }
+
+    /// A normalizer as `Normalizer::new` builds one on Windows: every needle
+    /// folded to `/`, while the diagnostics it is handed still hold `\`.
+    fn windows_normalizer() -> Normalizer {
+        Normalizer {
+            scratch_absolute: "D:/w/target/nocompile/host/project/src/bin/f_a.rs".into(),
+            scratch_relative: "src/bin/f_a.rs".into(),
+            bin: "f_a".into(),
+            scratch_root: "D:/w/target/nocompile/host".into(),
+            manifest_dir: "D:/w".into(),
+            cargo_home: Some("C:/Users/u/.cargo".into()),
+            dependencies: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn folds_a_windows_path_under_the_manifest_dir() {
+        let out = windows_normalizer().normalize("note: D:\\w\\src\\lib.rs:9:1\n", "f.rs");
+        assert_eq!(out, "note: $DIR/src/lib.rs:9:1\n");
+    }
+
+    /// The whole of the Windows failure in one line. `bin_relative` spells the
+    /// scratch main with `/`, rustc spells it with `\`, so the fixture's own
+    /// span went unrecognized -- and a span that does not point into the fixture
+    /// loses its line and column, so every golden mismatched at its first
+    /// diagnostic for a reason no fixture asserts.
+    #[test]
+    fn folds_the_windows_scratch_main_to_the_fixture() {
+        let out = windows_normalizer().normalize(" --> src\\bin\\f_a.rs:4:9\n", "tests/ui/a.rs");
+        assert_eq!(out, " --> tests/ui/a.rs:4:9\n");
+    }
+
+    /// An ordinary Windows home directory holds a space, and a fold bounded by
+    /// the run of text around the path stopped at it -- leaving this change not
+    /// firing at all for every developer who has one. The line is the unit for
+    /// this reason.
+    #[test]
+    fn folds_a_windows_path_that_contains_a_space() {
+        let mut n = windows_normalizer();
+        n.manifest_dir = "C:/Users/My Name/w".into();
+        let out = n.normalize("note: C:\\Users\\My Name\\w\\src\\lib.rs:9:1\n", "f.rs");
+        assert_eq!(out, "note: $DIR/src/lib.rs:9:1\n");
+    }
+
+    /// The cost of taking the line as the unit, pinned so it stays deliberate: a
+    /// line holding both a machine path and a real escape folds the escape too.
+    /// Reaching it needs a fixture whose own source names this machine's
+    /// manifest directory, which a checked-in fixture cannot do.
+    #[test]
+    fn folds_an_escape_sharing_a_line_with_a_path() {
+        let out = windows_normalizer().normalize("note: D:\\w\\src\\lib.rs and \\d\n", "f.rs");
+        assert_eq!(out, "note: $DIR/src/lib.rs and /d\n");
+    }
+
+    #[test]
+    fn folds_a_windows_sysroot_path() {
+        let out = windows_normalizer().normalize(
+            " --> C:\\Users\\u\\.rustup\\toolchains\\stable\\lib\\rustlib\\src\\rust\\library\\core\\src\\clone.rs\n",
+            "f.rs",
+        );
+        assert_eq!(out, " --> $RUST/core/src/clone.rs\n");
+    }
+
+    /// The reason the fold is anchored to a known path rather than applied to
+    /// every `\` in the line. A diagnostic about an escape is one a compile-fail
+    /// harness exists to pin, and it holds a backslash that is not a separator.
+    #[test]
+    fn leaves_a_character_escape_alone() {
+        let out = windows_normalizer().normalize("error: unknown character escape: \\d\n", "f.rs");
+        assert_eq!(out, "error: unknown character escape: \\d\n");
+    }
+
+    /// The same guarantee for a fixture's own source, which a golden quotes
+    /// verbatim: the file has the same bytes on every platform, so a backslash
+    /// in it is never a separator to fold.
+    #[test]
+    fn leaves_a_backslash_in_fixture_source_alone() {
+        let text = "4 |     let s = \"a\\nb\";\n";
+        let out = windows_normalizer().normalize(text, "tests/ui/a.rs");
         assert_eq!(out, text);
     }
 }

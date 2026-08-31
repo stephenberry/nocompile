@@ -7,6 +7,26 @@ use std::path::{Path, PathBuf};
 
 use crate::compare::Mode;
 use crate::diff;
+use crate::normalize::RUST;
+
+/// Shown when a mismatch involves a span into the standard library.
+///
+/// The rendering of such a span depends on whether the `rust-src` component is
+/// installed, which typically differs between a developer's machine and a CI
+/// runner -- so the diff above may be recording the environment rather than
+/// anything the fixture asserts. Nothing normalizes it away: without the source
+/// rustc does not merely omit the snippet rows, it re-renders each annotation as
+/// a `= note:` and splits one annotated block into one span header per
+/// annotation, so the two renderings differ in their *number* of span headers
+/// and no substitution can reconcile them.
+const STD_SOURCE_HINT: &str = "\
+this diagnostic reaches into the standard library, whose source rustc renders \
+only where the `rust-src` component is installed. A golden blessed with it does \
+not match a machine without it, or the reverse -- so this diff may be the \
+environment differing rather than the fixture. Install it wherever the goldens \
+are blessed and wherever they are checked (`rustup component add rust-src`; a \
+`--profile minimal` toolchain omits it). `Mode::Brief` narrows this but does not \
+close it.";
 
 /// What a fixture is asserted to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -169,10 +189,12 @@ impl Display for Failure {
                     write!(f, ", first difference at line {line}")?;
                 }
                 let diff = diff::unified(expected, actual, &golden.display().to_string(), "actual");
-                write!(
-                    f,
-                    "\n\n{diff}\nrun with NOCOMPILE=overwrite to update the golden"
-                )
+                write!(f, "\n\n{diff}")?;
+                // Only where it can be the cause, so it stays a signal.
+                if expected.contains(RUST) || actual.contains(RUST) {
+                    write!(f, "\n{STD_SOURCE_HINT}\n")?;
+                }
+                write!(f, "\nrun with NOCOMPILE=overwrite to update the golden")
             }
             Failure::NoFixtures { directory } => write!(
                 f,

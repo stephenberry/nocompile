@@ -202,6 +202,22 @@ The same trade applies to the edition: there is no host manifest to read it from
 t.edition("2021");
 ```
 
+## The standard library's source
+
+A diagnostic that reaches into `std` or `core` renders that part only where the
+`rust-src` component is installed. Developers usually have it, because
+rust-analyzer wants it; a CI runner usually does not, and `--profile minimal`
+omits it. Without it rustc does not merely drop the source rows -- it re-renders
+each annotation as a `= note:` and splits one annotated block into one span
+header per annotation, so the two renderings differ in their number of span
+headers and normalization cannot reconcile them.
+
+So this is an environment requirement, not something the harness can hide:
+install `rust-src` wherever goldens are blessed and wherever they are checked.
+Most suites never meet it -- a fixture has to produce a span into the standard
+library at all -- and a mismatch that does say so in its failure message.
+`Mode::Brief` narrows the exposure without closing it.
+
 ## Requirements on fixtures
 
 - A fixture is built as a bin and compiled **verbatim**, so it must define `fn main`, as `trybuild` fixtures do. The harness does not add one: detecting a real `fn main` needs a parser, and a wrong guess writes harness-injected source into the golden under the fixture's own name. A fixture without one gets a plain `E0601`, which says what to do about it.

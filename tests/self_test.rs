@@ -171,6 +171,55 @@ fn a_rejected_fixture_with_a_wrong_golden_fails() {
     );
 }
 
+/// A mismatch on a diagnostic that reaches into the standard library says why
+/// it might not be the fixture's fault.
+///
+/// Whether `rust-src` is installed changes how such a span renders, and it
+/// typically differs between a developer's machine and CI, so a golden can be
+/// correct on the machine that blessed it and wrong everywhere else. The
+/// harness cannot normalize that away, so it has to explain it. The fixture
+/// reaches `core`'s `Add` impls, which carry a `$RUST` span either way -- with
+/// the source or, on a machine without it, as `/rustc/<hash>/`.
+#[test]
+fn a_mismatch_reaching_into_std_explains_the_rust_src_dependency() {
+    let sandbox = Sandbox::new("std-source-hint");
+    sandbox.write("ui/add.rs", "fn main() {\n    let _ = 1u8 + \"s\";\n}\n");
+
+    let mut t = sandbox.cases();
+    t.compile_fail("ui/add.rs");
+    assert_passed(&t.overwrite(true).run());
+
+    let golden = sandbox.read("ui/add.stderr");
+    assert!(
+        golden.contains("$RUST"),
+        "fixture no longer reaches std: {golden}"
+    );
+    sandbox.write("ui/add.stderr", &golden.replace("E0277", "E0999"));
+
+    let report = t.overwrite(false).run().report();
+    assert!(report.contains("rustup component add rust-src"), "{report}");
+}
+
+/// The hint stays a signal: an ordinary mismatch that never leaves the fixture
+/// must not carry it.
+#[test]
+fn a_mismatch_that_stays_in_the_fixture_carries_no_hint() {
+    let sandbox = Sandbox::new("no-std-source-hint");
+    sandbox.write("ui/rejected.rs", REJECTED);
+
+    let mut t = sandbox.cases();
+    t.compile_fail("ui/rejected.rs");
+    assert_passed(&t.overwrite(true).run());
+
+    let corrupted = sandbox
+        .read("ui/rejected.stderr")
+        .replace("mismatched types", "some other problem entirely");
+    sandbox.write("ui/rejected.stderr", &corrupted);
+
+    let report = t.overwrite(false).run().report();
+    assert!(!report.contains("rust-src"), "{report}");
+}
+
 /// 3. A fixture that compiles, declared `compile_fail`, must fail.
 #[test]
 fn a_fixture_that_compiles_fails_a_compile_fail_case() {
