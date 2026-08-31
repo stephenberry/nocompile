@@ -9,6 +9,18 @@ use crate::compare::Mode;
 use crate::diff;
 use crate::normalize::RUST;
 
+/// Shown when the two texts differ only outside what a line-based diff can show.
+///
+/// `str::lines` drops a trailing newline and the `\r` of a CRLF pair, so two
+/// texts can compare unequal while every line of them matches. CRLF itself is
+/// handled before the comparison now, but a golden hand-edited to lose its final
+/// newline still lands here -- and without this the report states a mismatch and
+/// then renders a diff with nothing in it.
+const INVISIBLE_DIFFERENCE_HINT: &str = "\
+the two texts differ only in characters this diff cannot show: a trailing newline, \
+or a carriage return that is not part of a CRLF pair. Re-bless the golden to settle \
+it.";
+
 /// Shown when a mismatch involves a span into the standard library.
 ///
 /// The rendering of such a span depends on whether the `rust-src` component is
@@ -190,6 +202,9 @@ impl Display for Failure {
                 }
                 let diff = diff::unified(expected, actual, &golden.display().to_string(), "actual");
                 write!(f, "\n\n{diff}")?;
+                if expected.lines().eq(actual.lines()) {
+                    write!(f, "\n{INVISIBLE_DIFFERENCE_HINT}\n")?;
+                }
                 // Only where it can be the cause, so it stays a signal.
                 if expected.contains(RUST) || actual.contains(RUST) {
                     write!(f, "\n{STD_SOURCE_HINT}\n")?;
