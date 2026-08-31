@@ -88,6 +88,8 @@
 use crate::scratch::Dependency;
 use std::env;
 use std::path::Path;
+use std::process::Command;
+use std::sync::OnceLock;
 
 /// Placeholder for the host crate's manifest directory.
 pub(crate) const DIR: &str = "$DIR";
@@ -124,6 +126,8 @@ pub(crate) struct Normalizer {
     manifest_dir: String,
     /// `CARGO_HOME`, if it can be determined.
     cargo_home: Option<String>,
+    /// The toolchain's sysroot, if `rustc` would say.
+    sysroot: Option<String>,
     /// One `(absolute path, placeholder)` per declared path dependency, longest
     /// path first.
     dependencies: Vec<(String, String)>,
@@ -156,6 +160,7 @@ impl Normalizer {
             scratch_root: fold_separators(scratch_root),
             manifest_dir: fold_separators(manifest_dir),
             cargo_home: cargo_home().map(|home| fold_separators(&home)),
+            sysroot: sysroot().map(str::to_string),
             dependencies,
         }
     }
@@ -243,6 +248,14 @@ impl Normalizer {
         // Before `CARGO_HOME`, which is a sibling of the toolchain directory
         // rather than a parent of it, so the two never compete -- but the
         // sysroot is the more specific rule and reads better first.
+        //
+        // A known sysroot is matched as a prefix, which is the only way to get
+        // this right: see `sysroot`. `replace_sysroot` stays as the fallback for
+        // a fixture built against a toolchain this process cannot ask about.
+        let line = match &self.sysroot {
+            Some(root) => replace_sysroot_prefix(&line, root),
+            None => line,
+        };
         let line = replace_sysroot(&line);
 
         let line = match &self.cargo_home {
@@ -853,6 +866,23 @@ fn indent(line: &str) -> usize {
 /// layout; and the `/rustc/<commit>/library` form a distributed toolchain
 /// reports. Any trait bound involving a std type produces one, which makes this
 /// the most common way a golden stops being portable.
+/// Replace a *known* sysroot's source directory with `$RUST`.
+///
+/// Anchored on the path itself rather than on a marker inside it, so the start
+/// of the path is known rather than guessed. That is the whole difference: see
+/// `sysroot` for what the guess gets wrong.
+fn replace_sysroot_prefix(line: &str, root: &str) -> String {
+    // The two layouts `replace_sysroot` knows, minus their trailing separator,
+    // which `replace_dir` needs to see as the boundary it anchors on.
+    const SOURCE_DIRS: [&str; 2] = ["/lib/rustlib/src/rust/library", "/lib/rustlib/src/rust/src"];
+
+    let mut out = line.to_string();
+    for dir in SOURCE_DIRS {
+        out = replace_dir(&out, &format!("{root}{dir}"), RUST);
+    }
+    out
+}
+
 fn replace_sysroot(line: &str) -> String {
     const MARKERS: [&str; 2] = [
         "/lib/rustlib/src/rust/library/",
@@ -944,6 +974,49 @@ fn replace_registry_src(line: &str, cargo_home: &str) -> String {
     out
 }
 
+/// The toolchain's sysroot, as `rustc` reports it, asked once per process.
+///
+/// Knowing the path turns finding it in a line of prose from a guess into a
+/// prefix match, and the guess cannot be made right. `path_start` walks back
+/// from the marker inside the path to the nearest whitespace, because in prose
+/// there is nothing else to walk back to -- so a toolchain under a directory
+/// whose name holds a space keeps everything up to that space:
+///
+/// ```text
+///  --> /Users/My Name/.rustup/toolchains/stable/lib/rustlib/src/rust/library/core/src/clone.rs
+///  --> /Users/My $RUST/core/src/clone.rs
+/// ```
+///
+/// A space is ordinary in a directory name on every platform this runs on, and
+/// the resulting golden is both wrong and unshareable.
+///
+/// `None` if `rustc` cannot be run or says nothing useful, which leaves the
+/// marker fallback in `replace_sysroot` exactly as it was.
+fn sysroot() -> Option<&'static str> {
+    static SYSROOT: OnceLock<Option<String>> = OnceLock::new();
+
+    SYSROOT
+        .get_or_init(|| {
+            // `RUSTC` for the same reason `compile` uses `CARGO`: build the
+            // fixture and read the diagnostics with one toolchain, not two.
+            let rustc = env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+            let output = Command::new(rustc)
+                .args(["--print", "sysroot"])
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let root = String::from_utf8(output.stdout).ok()?;
+            let root = root.trim_end();
+            if root.is_empty() {
+                return None;
+            }
+            Some(fold_separators(Path::new(root)))
+        })
+        .as_deref()
+}
+
 /// `CARGO_HOME` if set, else the conventional `~/.cargo`.
 fn cargo_home() -> Option<std::path::PathBuf> {
     if let Some(home) = env::var_os("CARGO_HOME") {
@@ -965,6 +1038,7 @@ mod tests {
             scratch_root: "/w/target/nocompile/host".into(),
             manifest_dir: "/w".into(),
             cargo_home: Some("/home/u/.cargo".into()),
+            sysroot: Some("/home/u/.rustup/toolchains/stable".into()),
             dependencies: Vec::new(),
         }
     }
@@ -1885,8 +1959,61 @@ mod tests {
             scratch_root: "D:/w/target/nocompile/host".into(),
             manifest_dir: "D:/w".into(),
             cargo_home: Some("C:/Users/u/.cargo".into()),
+            sysroot: Some("C:/Users/u/.rustup/toolchains/stable".into()),
             dependencies: Vec::new(),
         }
+    }
+
+    /// The bug a known sysroot exists to fix. `path_start` walks back to the
+    /// nearest whitespace, so the space in `My Name` ended the path as far as
+    /// the marker rule could tell, and the golden kept half a home directory.
+    #[test]
+    fn a_sysroot_under_a_name_with_a_space_is_replaced_whole() {
+        let mut n = normalizer();
+        n.sysroot = Some("/Users/My Name/.rustup/toolchains/stable".into());
+        let out = n.normalize(
+            " --> /Users/My Name/.rustup/toolchains/stable/lib/rustlib/src/rust/library/core/src/clone.rs:9:1\n",
+            "f.rs",
+        );
+        assert_eq!(out, " --> $RUST/core/src/clone.rs\n");
+    }
+
+    /// The `src` layout as well as the `library` one.
+    #[test]
+    fn a_sysroot_src_layout_is_replaced_whole() {
+        let mut n = normalizer();
+        n.sysroot = Some("/Users/My Name/rust".into());
+        let out = n.normalize(
+            "note: /Users/My Name/rust/lib/rustlib/src/rust/src/core/src/clone.rs:9:1\n",
+            "f.rs",
+        );
+        assert_eq!(out, "note: $RUST/core/src/clone.rs:9:1\n");
+    }
+
+    /// A sysroot this process cannot ask about still gets the marker rule, which
+    /// is right whenever the path holds no space.
+    #[test]
+    fn an_unknown_sysroot_still_falls_back_to_the_marker() {
+        let mut n = normalizer();
+        n.sysroot = None;
+        let out = n.normalize(
+            " --> /opt/rust/lib/rustlib/src/rust/library/core/src/clone.rs\n",
+            "f.rs",
+        );
+        assert_eq!(out, " --> $RUST/core/src/clone.rs\n");
+    }
+
+    /// A sysroot on Windows, where the space is the common case rather than the
+    /// awkward one: `C:\Users\First Last`.
+    #[test]
+    fn folds_and_replaces_a_windows_sysroot_with_a_space() {
+        let mut n = windows_normalizer();
+        n.sysroot = Some("C:/Users/First Last/.rustup/toolchains/stable".into());
+        let out = n.normalize(
+            " --> C:\\Users\\First Last\\.rustup\\toolchains\\stable\\lib\\rustlib\\src\\rust\\library\\core\\src\\clone.rs\n",
+            "f.rs",
+        );
+        assert_eq!(out, " --> $RUST/core/src/clone.rs\n");
     }
 
     #[test]
